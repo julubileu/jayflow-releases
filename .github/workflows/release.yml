@@ -1,0 +1,368 @@
+name: Publish JayFlow release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Matching v<VERSION> tag (short or refs/tags/) or full 40-character commit SHA
+        required: true
+        default: v2.0.33-dev
+        type: string
+      version:
+        description: Version without v prefix (X.Y.Z or X.Y.Z-dev)
+        required: true
+        default: 2.0.33-dev
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Validate, build, sign, and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GH_REPO: julubileu/jayflow-releases
+    steps:
+      - name: Check out the public release repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release inputs
+        id: inputs
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$INPUT_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-dev)?$ ]]; then
+            echo "::error::version must be X.Y.Z or X.Y.Z-dev, without a v prefix or leading zeroes"
+            exit 1
+          fi
+
+          EXPECTED_TAG="v${INPUT_VERSION}"
+          if [[ ! "$INPUT_REF" =~ ^[0-9a-fA-F]{40}$ ]] \
+            && [[ "$INPUT_REF" != "$EXPECTED_TAG" ]] \
+            && [[ "$INPUT_REF" != "refs/tags/${EXPECTED_TAG}" ]]; then
+            echo "::error::ref must match v${INPUT_VERSION}, refs/tags/v${INPUT_VERSION}, or be a full 40-character commit SHA"
+            exit 1
+          fi
+
+          printf 'version=%s\n' "$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          printf 'ref=%s\n' "$INPUT_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the private source at the validated ref
+        uses: actions/checkout@v4
+        with:
+          repository: julubileu/jayflow-v2
+          ref: ${{ steps.inputs.outputs.ref }}
+          ssh-key: ${{ secrets.JAYFLOW_SOURCE_DEPLOY_KEY }}
+          path: source
+          persist-credentials: false
+
+      - name: Record source identity
+        id: source
+        working-directory: source
+        env:
+          SOURCE_REF: ${{ steps.inputs.outputs.ref }}
+        run: |
+          set -euo pipefail
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          test "${#SOURCE_SHA}" -eq 40
+          printf 'sha=%s\n' "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          printf 'ref=%s\n' "$SOURCE_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go from the private source go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: source/go.mod
+          cache: true
+          cache-dependency-path: source/go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: source/cmd/jayflow/frontend/package-lock.json
+
+      - name: Install NSIS and expose the runner browser as Chromium
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nsis
+
+          CHROMIUM_SOURCE=""
+          for CANDIDATE in \
+            /usr/bin/google-chrome-stable \
+            /usr/bin/google-chrome \
+            /usr/bin/chromium; do
+            if [ -x "$CANDIDATE" ]; then
+              CHROMIUM_SOURCE="$CANDIDATE"
+              break
+            fi
+          done
+          if [ -z "$CHROMIUM_SOURCE" ]; then
+            echo "::error::the official GitHub runner image has no supported Chromium/Chrome executable"
+            exit 1
+          fi
+          if [ "$CHROMIUM_SOURCE" != /usr/bin/chromium ]; then
+            sudo ln -sfn -- "$CHROMIUM_SOURCE" /usr/bin/chromium
+          fi
+          /usr/bin/chromium --version
+
+      - name: Install frontend dependencies and Wails v2.14.0
+        working-directory: source
+        run: |
+          set -euo pipefail
+          npm ci --prefix cmd/jayflow/frontend --ignore-scripts --no-audit --no-fund
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.14.0
+          printf '%s\n' "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Gate 1 - release regression
+        working-directory: source
+        run: |
+          set -euo pipefail
+          bash tests/release-build-regression.sh
+
+      - name: Gate 2 - Go tests
+        working-directory: source
+        run: |
+          set -euo pipefail
+          go test -count=1 ./...
+
+      - name: Gate 3 - Go race detector
+        working-directory: source
+        run: |
+          set -euo pipefail
+          go test -race -count=1 ./...
+
+      - name: Gate 4 - Windows vet
+        working-directory: source
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go vet ./...
+
+      - name: Gate 5 - Windows build
+        working-directory: source
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./...
+
+      - name: Gate 6 - Linux build
+        working-directory: source
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
+
+      - name: Gate 7 - Go vet
+        working-directory: source
+        run: |
+          set -euo pipefail
+          go vet ./...
+
+      - name: Gate 8 - diff check
+        working-directory: source
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff --exit-code
+
+      - name: Gate 9 - all frontend and mobile tests, sequentially
+        working-directory: source/cmd/jayflow/frontend
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t TEST_FILES \
+            < <(find scripts -maxdepth 1 -type f -name '*.test.mjs' -print0 | sort -z)
+          if [ "${#TEST_FILES[@]}" -eq 0 ]; then
+            echo "::error::no frontend test files were found"
+            exit 1
+          fi
+          for TEST_FILE in "${TEST_FILES[@]}"; do
+            node "$TEST_FILE"
+          done
+          SHOTS_DIR="$(mktemp -d)"
+          trap 'rm -rf "$SHOTS_DIR"' EXIT
+          node scripts/mobile-shots.mjs "$SHOTS_DIR"
+
+      - name: Derive and verify the release public key
+        id: signing
+        working-directory: source
+        env:
+          JAYFLOW_RELEASE_PRIVATE_KEY: ${{ secrets.JAYFLOW_RELEASE_PRIVATE_KEY }}
+          EXPECTED_PUBLIC_KEY: ${{ vars.JAYFLOW_RELEASE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${JAYFLOW_RELEASE_PRIVATE_KEY:-}" ]; then
+            echo "::error::JAYFLOW_RELEASE_PRIVATE_KEY is not configured"
+            exit 1
+          fi
+          if [ -z "${EXPECTED_PUBLIC_KEY:-}" ]; then
+            echo "::error::JAYFLOW_RELEASE_PUBLIC_KEY is not configured"
+            exit 1
+          fi
+
+          PUBLIC_KEY="$(go run ./internal/updater/signtool -pubkey)"
+          echo "::add-mask::$PUBLIC_KEY"
+          if [ "$PUBLIC_KEY" != "$EXPECTED_PUBLIC_KEY" ]; then
+            echo "::error::the signing secret does not derive the configured release public key"
+            exit 1
+          fi
+          printf 'public_key=%s\n' "$PUBLIC_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Build the embedded Linux daemon
+        working-directory: source
+        env:
+          VERSION: ${{ steps.inputs.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p cmd/jayflow/embedded
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.Version=${VERSION}" \
+            -o cmd/jayflow/embedded/jayflowd ./cmd/jayflowd
+
+      - name: Build the stamped Windows app and NSIS installer
+        working-directory: source/cmd/jayflow
+        env:
+          VERSION: ${{ steps.inputs.outputs.version }}
+          PUBLIC_KEY: ${{ steps.signing.outputs.public_key }}
+        run: |
+          set -euo pipefail
+          node - "$VERSION" <<'NODE'
+          const fs = require('node:fs');
+          const version = process.argv[2];
+          const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-dev)?$/.exec(version);
+          if (!match) {
+            throw new Error('release version is not X.Y.Z or X.Y.Z-dev');
+          }
+          const windowsVersion = `${match[1]}.${match[2]}.${match[3]}.0`;
+          const path = 'wails.json';
+          const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+          if (!config.info || typeof config.info !== 'object') {
+            throw new Error('wails.json has no info object');
+          }
+          config.info.productVersion = windowsVersion;
+          fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+          NODE
+          wails build -platform windows/amd64 -webview2 download -nsis -installscope user -trimpath \
+            -ldflags "-X main.DaemonVersion=${VERSION} -X main.AppVersion=${VERSION} -X github.com/julubileu/jayflow-v2/internal/updater.PublicKeyBase64=${PUBLIC_KEY}"
+
+      - name: Audit Wails-generated changes
+        working-directory: source/cmd/jayflow
+        run: |
+          set -euo pipefail
+          REPO_ROOT="$(git rev-parse --show-toplevel)"
+          (
+            cd "$REPO_ROOT"
+            mapfile -d '' -t CHANGED_FILES < <(git diff --name-only -z)
+            for CHANGED_FILE in "${CHANGED_FILES[@]}"; do
+              if git diff --quiet --ignore-all-space -- "$CHANGED_FILE"; then
+                git restore --worktree -- "$CHANGED_FILE"
+              fi
+            done
+            git diff --check
+          )
+          mapfile -d '' -t UNTRACKED_BINDINGS \
+            < <(git ls-files --others --exclude-standard -z -- frontend/wailsjs/go)
+          if [ "${#UNTRACKED_BINDINGS[@]}" -ne 0 ]; then
+            echo "::error::Wails generated untracked frontend bindings"
+            exit 1
+          fi
+          git diff --exit-code -- frontend/wailsjs/go
+
+      - name: Stage and audit release assets
+        working-directory: source
+        env:
+          VERSION: ${{ steps.inputs.outputs.version }}
+          SOURCE_REF: ${{ steps.source.outputs.ref }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp cmd/jayflow/build/bin/JayFlow.exe "dist/JayFlow-${VERSION}.exe"
+
+          INSTALLER="$(find cmd/jayflow/build/bin -maxdepth 1 -type f -name '*installer*.exe' -print -quit)"
+          if [ -z "$INSTALLER" ]; then
+            echo "::error::Wails did not produce an NSIS installer"
+            exit 1
+          fi
+          cp "$INSTALLER" "dist/JayFlow-${VERSION}-setup.exe"
+          cp "$INSTALLER" "dist/JayFlow-setup.exe"
+
+          printf 'version=%s\nsource_ref=%s\nsource_sha=%s\n' \
+            "$VERSION" "$SOURCE_REF" "$SOURCE_SHA" > dist/buildinfo.txt
+
+      - name: Sign latest.json and create checksums
+        working-directory: source
+        env:
+          JAYFLOW_RELEASE_PRIVATE_KEY: ${{ secrets.JAYFLOW_RELEASE_PRIVATE_KEY }}
+          VERSION: ${{ steps.inputs.outputs.version }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_URL="https://github.com/julubileu/jayflow-releases/releases/download/v${VERSION}/JayFlow-${VERSION}.exe"
+          go run ./internal/updater/signtool \
+            -version "$VERSION" \
+            -artifact "dist/JayFlow-${VERSION}.exe" \
+            -url "$ARTIFACT_URL" \
+            -out dist/latest.json
+
+          (
+            cd dist
+            sha256sum \
+              "JayFlow-${VERSION}.exe" \
+              "JayFlow-${VERSION}-setup.exe" \
+              JayFlow-setup.exe \
+              latest.json \
+              buildinfo.txt > checksums.txt
+          )
+
+      - name: Create or update the public release
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.inputs.outputs.version }}
+          SOURCE_REF: ${{ steps.source.outputs.ref }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          NOTES_FILE="dist/release-notes.md"
+          printf '%s\n\n%s\n%s\n%s\n' \
+            "JayFlow ${VERSION}" \
+            "Signed update: Ed25519 manifest plus SHA-256 artifact digest." \
+            "Private source ref: ${SOURCE_REF}" \
+            "Private source SHA: ${SOURCE_SHA}" > "$NOTES_FILE"
+
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$GH_REPO" \
+              --title "JayFlow ${TAG}" \
+              --notes-file "$NOTES_FILE" \
+              --draft=false \
+              --prerelease=false \
+              --latest
+          else
+            gh release create "$TAG" \
+              --repo "$GH_REPO" \
+              --title "JayFlow ${TAG}" \
+              --notes-file "$NOTES_FILE" \
+              --prerelease=false \
+              --latest
+          fi
+
+          ASSETS=(
+            "dist/JayFlow-${VERSION}.exe"
+            "dist/JayFlow-${VERSION}-setup.exe"
+            "dist/JayFlow-setup.exe"
+            "dist/checksums.txt"
+            "dist/latest.json"
+            "dist/buildinfo.txt"
+          )
+          gh release upload "$TAG" "${ASSETS[@]}" --repo "$GH_REPO" --clobber
