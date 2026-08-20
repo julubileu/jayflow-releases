@@ -351,9 +351,9 @@ for required in (
         raise SystemExit(f"source epoch is not commit-derived/exported: {required}")
 
 stamp_script = scripts["Build the stamped Windows app and NSIS installer twice"]
-stamp_prefix, marker, build_suffix = stamp_script.partition("\nbuild_windows()")
+stamp_prefix, marker, build_suffix = stamp_script.partition("\nbuild_windows_app()")
 if not marker:
-    raise SystemExit("Windows build step does not define the reproducible build function")
+    raise SystemExit("Windows build step does not define the reproducible app build function")
 with tempfile.TemporaryDirectory() as temp_dir:
     config = pathlib.Path(temp_dir, "wails.json")
     config.write_text('{"info":{"productName":"JayFlow","productVersion":"2.0.0-dev"}}\n', encoding="utf-8")
@@ -366,6 +366,8 @@ with tempfile.TemporaryDirectory() as temp_dir:
         raise SystemExit("Wails productVersion must be numeric X.Y.Z")
 if "wails build" not in build_suffix:
     raise SystemExit("Windows build step does not invoke Wails")
+if 'wails build "$@"' not in build_suffix:
+    raise SystemExit("Windows app build function does not forward the one audited -nsis flag")
 if '-X main.DaemonVersion=${VERSION} -X main.AppVersion=${VERSION}' not in build_suffix:
     raise SystemExit("Windows build does not stamp both full AppVersion and DaemonVersion")
 if "PublicKeyBase64=${PUBLIC_KEY}" not in build_suffix:
@@ -375,28 +377,213 @@ for required in ("-platform windows/amd64", "-nsis", "-installscope user", "-tri
         raise SystemExit(f"Windows Wails build is missing {required}")
 for required in (
     'FIRST_BUILD_DIR="$RUNNER_TEMP/first-windows-build"',
+    'NSIS_PROJECT="build/windows/installer/project.nsi"',
+    'NSIS_TOOLS="build/windows/installer/wails_tools.nsh"',
+    'NSIS_BOOTSTRAPPER="build/windows/installer/tmp/MicrosoftEdgeWebview2Setup.exe"',
+    'NSIS_OUTPUT="build/bin/JayFlow-amd64-installer.exe"',
     "stamp_windows_metadata",
-    "build_windows",
+    "build_windows_app",
+    "make_nsis",
+    "SetDateSave off",
+    'sed -i \'1a SetDateSave off\' "$NSIS_PROJECT"',
+    "wails_tools.nsh must not override the project SetDateSave policy",
     "git restore --worktree -- wails.json frontend/wailsjs/go/models.ts",
     "rm -rf -- build/bin",
     'cmp -s "$FIRST_BUILD_DIR/JayFlow.exe" build/bin/JayFlow.exe',
-    'cmp -s "$FIRST_BUILD_DIR/installer.exe" "${SECOND_INSTALLERS[0]}"',
+    'cmp -s "$FIRST_BUILD_DIR/installer.exe" "$NSIS_OUTPUT"',
 ):
     if required not in stamp_script:
         raise SystemExit(f"Windows reproducibility proof is missing {required}")
-if len(re.findall(r"^build_windows$", stamp_script, re.MULTILINE)) != 2:
-    raise SystemExit("Windows app+NSIS must be built exactly twice")
+if len(re.findall(r"^build_windows_app(?: -nsis)?$", stamp_script, re.MULTILINE)) != 2:
+    raise SystemExit("Windows app must be built exactly twice")
+if len(re.findall(r"^build_windows_app -nsis$", stamp_script, re.MULTILINE)) != 1:
+    raise SystemExit("Wails must generate the NSIS project exactly once")
+if len(re.findall(r"^make_nsis$", stamp_script, re.MULTILINE)) != 2:
+    raise SystemExit("makensis must build the canonical installer exactly twice")
+if len(re.findall(r"^[ \t]*makensis \\$", stamp_script, re.MULTILINE)) != 1:
+    raise SystemExit("manual makensis must be defined exactly once")
+if stamp_script.count("-DARG_WAILS_AMD64_BINARY=../../bin/JayFlow.exe") != 1:
+    raise SystemExit("manual makensis must use the exact Wails amd64 binary define")
+if stamp_script.count("-DWAILS_INSTALL_SCOPE=user") != 1:
+    raise SystemExit("manual makensis must use the exact Wails user-scope define")
+if stamp_script.count("-DREQUEST_EXECUTION_LEVEL=user") != 1:
+    raise SystemExit("manual makensis must use the exact Wails execution-level define")
+if "touch " in stamp_script or "SOURCE_DATE_EPOCH=" in stamp_script:
+    raise SystemExit("Windows build must not normalize mtimes or replace the commit-derived epoch")
 if len(re.findall(r"^stamp_windows_metadata$", stamp_script, re.MULTILINE)) != 2:
     raise SystemExit("both Windows builds must start from the same metadata stamp")
-first_build = stamp_script.index("\nbuild_windows\n")
+first_build = stamp_script.index("\nbuild_windows_app -nsis\n")
+date_save = stamp_script.index("sed -i '1a SetDateSave off'")
+first_makensis = stamp_script.index("\nmake_nsis\n")
+preserve_first = stamp_script.index('cp "$NSIS_OUTPUT" "$FIRST_BUILD_DIR/installer.exe"')
 restore = stamp_script.index("git restore --worktree -- wails.json frontend/wailsjs/go/models.ts")
 second_stamp = stamp_script.rindex("\nstamp_windows_metadata\n")
-second_build = stamp_script.rindex("\nbuild_windows\n")
-if not first_build < restore < second_stamp < second_build:
-    raise SystemExit("Windows build inputs are not restored and restamped between builds")
+second_build = stamp_script.rindex("\nbuild_windows_app\n")
+second_makensis = stamp_script.rindex("\nmake_nsis\n")
+compare_app = stamp_script.index('cmp -s "$FIRST_BUILD_DIR/JayFlow.exe" build/bin/JayFlow.exe')
+compare_installer = stamp_script.index('cmp -s "$FIRST_BUILD_DIR/installer.exe" "$NSIS_OUTPUT"')
+if not (
+    first_build < date_save < first_makensis < preserve_first < restore < second_stamp
+    < second_build < second_makensis < compare_app < compare_installer
+):
+    raise SystemExit("Windows app/NSIS generation, preservation, and comparison order is wrong")
+
+with tempfile.TemporaryDirectory() as temp_dir_text:
+    temp_dir = pathlib.Path(temp_dir_text)
+    project_dir = temp_dir / "source" / "cmd" / "jayflow"
+    project_dir.mkdir(parents=True)
+    (project_dir / "frontend" / "wailsjs" / "go").mkdir(parents=True)
+    (project_dir / "frontend" / "wailsjs" / "go" / "models.ts").write_text(
+        "fixture\n", encoding="utf-8"
+    )
+    (project_dir / "wails.json").write_text(
+        '{"info":{"productName":"JayFlow","productVersion":"2.0.0-dev"}}\n',
+        encoding="utf-8",
+    )
+    fake_bin = temp_dir / "fake-bin"
+    fake_bin.mkdir()
+    call_log = temp_dir / "calls.jsonl"
+
+    fake_wails = fake_bin / "wails"
+    fake_wails.write_text(r'''#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+
+root = pathlib.Path.cwd()
+with pathlib.Path(os.environ["FAKE_BUILD_LOG"]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({
+        "tool": "wails",
+        "args": sys.argv[1:],
+        "source_date_epoch": os.environ.get("SOURCE_DATE_EPOCH"),
+    }) + "\n")
+count_file = pathlib.Path(os.environ["FAKE_WAILS_COUNT"])
+count = int(count_file.read_text(encoding="utf-8")) + 1 if count_file.exists() else 1
+count_file.write_text(str(count), encoding="utf-8")
+binary = root / "build" / "bin" / "JayFlow.exe"
+binary.parent.mkdir(parents=True, exist_ok=True)
+binary.write_bytes(b"identical JayFlow app bytes\n")
+mtime = 1700000000 + count
+os.utime(binary, (mtime, mtime))
+if "-nsis" in sys.argv[1:]:
+    installer = root / "build" / "windows" / "installer"
+    (installer / "tmp").mkdir(parents=True, exist_ok=True)
+    (installer / "project.nsi").write_text(
+        'Unicode true\n\n!include "wails_tools.nsh"\n'
+        'Section\n  !insertmacro wails.webview2runtime\n'
+        '  !insertmacro wails.files\nSectionEnd\n',
+        encoding="utf-8",
+    )
+    (installer / "wails_tools.nsh").write_text(
+        '!macro wails.files\n'
+        '  File "/oname=${PRODUCT_EXECUTABLE}" "${ARG_WAILS_AMD64_BINARY}"\n'
+        '!macroend\n'
+        '!macro wails.webview2runtime\n'
+        '  File "tmp\\MicrosoftEdgeWebview2Setup.exe"\n'
+        '!macroend\n',
+        encoding="utf-8",
+    )
+    (installer / "tmp" / "MicrosoftEdgeWebview2Setup.exe").write_bytes(
+        b"webview bootstrapper bytes\n"
+    )
+    (root / "build" / "bin" / "JayFlow-amd64-installer.exe").write_bytes(
+        b"automatic Wails installer must be discarded\n"
+    )
+''', encoding="utf-8")
+    fake_wails.chmod(0o755)
+
+    fake_makensis = fake_bin / "makensis"
+    fake_makensis.write_text(r'''#!/usr/bin/env python3
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+args = sys.argv[1:]
+with pathlib.Path(os.environ["FAKE_BUILD_LOG"]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({
+        "tool": "makensis",
+        "args": args,
+        "source_date_epoch": os.environ.get("SOURCE_DATE_EPOCH"),
+    }) + "\n")
+expected = [
+    "-DARG_WAILS_AMD64_BINARY=../../bin/JayFlow.exe",
+    "-DWAILS_INSTALL_SCOPE=user",
+    "-DREQUEST_EXECUTION_LEVEL=user",
+    "project.nsi",
+]
+if args != expected:
+    raise SystemExit(f"unexpected makensis arguments: {args!r}")
+project = pathlib.Path("project.nsi")
+lines = project.read_text(encoding="utf-8").splitlines()
+if lines.count("SetDateSave off") != 1:
+    raise SystemExit("SetDateSave off must be an exact unique line")
+if lines[1] != "SetDateSave off":
+    raise SystemExit("SetDateSave off must be exact line 2")
+if lines.index("SetDateSave off") >= lines.index('!include "wails_tools.nsh"'):
+    raise SystemExit("SetDateSave off must precede the Wails File macros")
+tools = pathlib.Path("wails_tools.nsh").read_text(encoding="utf-8")
+for required_file in (
+    'File "/oname=${PRODUCT_EXECUTABLE}" "${ARG_WAILS_AMD64_BINARY}"',
+    'File "tmp\\MicrosoftEdgeWebview2Setup.exe"',
+):
+    if required_file not in tools:
+        raise SystemExit(f"missing relevant NSIS File input: {required_file}")
+binary = pathlib.Path("../../bin/JayFlow.exe")
+body = binary.read_bytes()
+digest = hashlib.sha256(b"manual-nsis\0" + body).digest()
+pathlib.Path("../../bin/JayFlow-amd64-installer.exe").write_bytes(digest)
+''', encoding="utf-8")
+    fake_makensis.chmod(0o755)
+
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+
+    env = safe_env.copy()
+    env.update({
+        "PATH": f"{fake_bin}:{safe_env['PATH']}",
+        "VERSION": "2.0.33-dev",
+        "PUBLIC_KEY": "test-public-key",
+        "RUNNER_TEMP": str(temp_dir / "runner-temp"),
+        "SOURCE_DATE_EPOCH": "1700000000",
+        "FAKE_BUILD_LOG": str(call_log),
+        "FAKE_WAILS_COUNT": str(temp_dir / "wails-count"),
+    })
+    pathlib.Path(env["RUNNER_TEMP"]).mkdir()
+    result = checked(["bash", "-c", stamp_script], cwd=project_dir, env=env)
+    require_success(result, "behavioral Windows/NSIS reproducibility workflow")
+
+    calls = [
+        json.loads(line)
+        for line in call_log.read_text(encoding="utf-8").splitlines()
+    ]
+    wails_calls = [call for call in calls if call["tool"] == "wails"]
+    makensis_calls = [call for call in calls if call["tool"] == "makensis"]
+    if len(wails_calls) != 2 or "-nsis" not in wails_calls[0]["args"]:
+        raise SystemExit("behavioral workflow must use the first Wails build to generate NSIS")
+    if "-nsis" in wails_calls[1]["args"]:
+        raise SystemExit("second Wails build must not overwrite the generated NSIS project")
+    if [arg for arg in wails_calls[0]["args"] if arg != "-nsis"] != wails_calls[1]["args"]:
+        raise SystemExit("both Wails app builds must use identical arguments except for first-build -nsis")
+    if any(call["source_date_epoch"] != "1700000000" for call in wails_calls):
+        raise SystemExit("SOURCE_DATE_EPOCH did not reach both Wails app builds")
+    if len(makensis_calls) != 2:
+        raise SystemExit("behavioral workflow did not execute manual makensis twice")
+    if any(call["source_date_epoch"] != "1700000000" for call in makensis_calls):
+        raise SystemExit("SOURCE_DATE_EPOCH did not reach both manual makensis builds")
+    first_installer = pathlib.Path(env["RUNNER_TEMP"]) / "first-windows-build" / "installer.exe"
+    second_installer = project_dir / "build" / "bin" / "JayFlow-amd64-installer.exe"
+    if first_installer.read_bytes() != second_installer.read_bytes():
+        raise SystemExit("behavioral workflow did not preserve/compare reproducible manual installers")
+    if first_installer.read_bytes() == b"automatic Wails installer must be discarded\n":
+        raise SystemExit("automatic Wails installer was preserved instead of the manual canonical output")
 
 nsis_audit = scripts["Audit pinned Wails NSIS user-scope semantics"]
 for required in (
+    "-DARG_WAILS_AMD64_BINARY=",
     "-DWAILS_INSTALL_SCOPE=user",
     "-DREQUEST_EXECUTION_LEVEL=user",
     '$LOCALAPPDATA\\Programs\\${INFO_PRODUCTNAME}',

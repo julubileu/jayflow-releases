@@ -172,6 +172,7 @@ jobs:
           WAILS_ROOT="$(go env GOPATH)/pkg/mod/github.com/wailsapp/wails/v2@v2.14.0"
           NSIS_BUILDER="$WAILS_ROOT/pkg/commands/build/nsis_installer.go"
           NSIS_TEMPLATE="$WAILS_ROOT/pkg/buildassets/build/windows/installer/project.nsi"
+          grep -Fq 'args = append(args, "-DARG_WAILS_AMD64_BINARY="+amd64Binary)' "$NSIS_BUILDER"
           grep -Fq 'args = append(args, "-DWAILS_INSTALL_SCOPE=user")' "$NSIS_BUILDER"
           grep -Fq 'args = append(args, "-DREQUEST_EXECUTION_LEVEL=user")' "$NSIS_BUILDER"
           grep -Fq 'InstallDir "$LOCALAPPDATA\Programs\${INFO_PRODUCTNAME}"' "$NSIS_TEMPLATE"
@@ -289,44 +290,98 @@ jobs:
           }
 
           stamp_windows_metadata
-          build_windows() {
-            wails build -platform windows/amd64 -webview2 download -nsis -installscope user -trimpath \
+          build_windows_app() {
+            wails build "$@" -platform windows/amd64 -webview2 download -installscope user -trimpath \
               -ldflags "-X main.DaemonVersion=${VERSION} -X main.AppVersion=${VERSION} -X github.com/julubileu/jayflow-v2/internal/updater.PublicKeyBase64=${PUBLIC_KEY}"
+          }
+
+          NSIS_PROJECT="build/windows/installer/project.nsi"
+          NSIS_TOOLS="build/windows/installer/wails_tools.nsh"
+          NSIS_BOOTSTRAPPER="build/windows/installer/tmp/MicrosoftEdgeWebview2Setup.exe"
+          NSIS_OUTPUT="build/bin/JayFlow-amd64-installer.exe"
+
+          audit_nsis_project() {
+            for GENERATED_INPUT in "$NSIS_PROJECT" "$NSIS_TOOLS" "$NSIS_BOOTSTRAPPER"; do
+              if [ ! -f "$GENERATED_INPUT" ]; then
+                echo "::error::Wails did not generate required NSIS input $GENERATED_INPUT"
+                exit 1
+              fi
+            done
+
+            mapfile -t DATE_SAVE_DIRECTIVES \
+              < <(grep -nE '^[[:space:]]*SetDateSave([[:space:]]|$)' "$NSIS_PROJECT" || true)
+            if [ "${#DATE_SAVE_DIRECTIVES[@]}" -ne 1 ] \
+              || [ "${DATE_SAVE_DIRECTIVES[0]}" != "2:SetDateSave off" ]; then
+              echo "::error::project.nsi must contain only exact line 2: SetDateSave off"
+              printf 'SetDateSave directive: %s\n' "${DATE_SAVE_DIRECTIVES[@]:-none}" >&2
+              exit 1
+            fi
+
+            mapfile -t TOOLS_INCLUDES \
+              < <(grep -nFx '!include "wails_tools.nsh"' "$NSIS_PROJECT" || true)
+            if [ "${#TOOLS_INCLUDES[@]}" -ne 1 ] \
+              || (( ${TOOLS_INCLUDES[0]%%:*} <= 2 )); then
+              echo "::error::SetDateSave off must precede the unique Wails tools include"
+              exit 1
+            fi
+            grep -Fq 'File "/oname=${PRODUCT_EXECUTABLE}" "${ARG_WAILS_AMD64_BINARY}"' "$NSIS_TOOLS"
+            grep -Fq 'File "tmp\MicrosoftEdgeWebview2Setup.exe"' "$NSIS_TOOLS"
+            if grep -qE '^[[:space:]]*SetDateSave([[:space:]]|$)' "$NSIS_TOOLS"; then
+              echo "::error::wails_tools.nsh must not override the project SetDateSave policy"
+              exit 1
+            fi
+          }
+
+          make_nsis() {
+            audit_nsis_project
+            (
+              cd "$(dirname "$NSIS_PROJECT")"
+              makensis \
+                "-DARG_WAILS_AMD64_BINARY=../../bin/JayFlow.exe" \
+                -DWAILS_INSTALL_SCOPE=user \
+                -DREQUEST_EXECUTION_LEVEL=user \
+                project.nsi
+            )
+            if [ ! -f "$NSIS_OUTPUT" ]; then
+              echo "::error::manual makensis did not produce the canonical amd64 installer"
+              exit 1
+            fi
           }
 
           FIRST_BUILD_DIR="$RUNNER_TEMP/first-windows-build"
           mkdir "$FIRST_BUILD_DIR"
           rm -rf -- build/bin
-          build_windows
-          mapfile -d '' -t FIRST_INSTALLERS \
-            < <(find build/bin -maxdepth 1 -type f -name '*-amd64-installer.exe' -print0)
-          if [ "${#FIRST_INSTALLERS[@]}" -ne 1 ]; then
-            echo "::error::first Wails build did not produce exactly one amd64 NSIS installer"
+          build_windows_app -nsis
+          if [ ! -f "$NSIS_OUTPUT" ]; then
+            echo "::error::initial Wails NSIS generation did not produce its disposable installer"
             exit 1
           fi
+          if grep -qE '^[[:space:]]*SetDateSave([[:space:]]|$)' "$NSIS_PROJECT"; then
+            echo "::error::Wails-generated project.nsi unexpectedly already controls SetDateSave"
+            exit 1
+          fi
+          sed -i '1a SetDateSave off' "$NSIS_PROJECT"
+          audit_nsis_project
+          rm -f -- "$NSIS_OUTPUT"
+          make_nsis
           cp build/bin/JayFlow.exe "$FIRST_BUILD_DIR/JayFlow.exe"
-          cp "${FIRST_INSTALLERS[0]}" "$FIRST_BUILD_DIR/installer.exe"
+          cp "$NSIS_OUTPUT" "$FIRST_BUILD_DIR/installer.exe"
 
           git restore --worktree -- wails.json frontend/wailsjs/go/models.ts
           stamp_windows_metadata
           rm -rf -- build/bin
-          build_windows
-          mapfile -d '' -t SECOND_INSTALLERS \
-            < <(find build/bin -maxdepth 1 -type f -name '*-amd64-installer.exe' -print0)
-          if [ "${#SECOND_INSTALLERS[@]}" -ne 1 ]; then
-            echo "::error::second Wails build did not produce exactly one amd64 NSIS installer"
-            exit 1
-          fi
+          build_windows_app
+          make_nsis
           if ! cmp -s "$FIRST_BUILD_DIR/JayFlow.exe" build/bin/JayFlow.exe; then
             echo "::error::portable Windows build is not byte-for-byte reproducible"
             exit 1
           fi
-          if ! cmp -s "$FIRST_BUILD_DIR/installer.exe" "${SECOND_INSTALLERS[0]}"; then
+          if ! cmp -s "$FIRST_BUILD_DIR/installer.exe" "$NSIS_OUTPUT"; then
             echo "::error::NSIS setup build is not byte-for-byte reproducible"
             exit 1
           fi
           sha256sum "$FIRST_BUILD_DIR/JayFlow.exe" build/bin/JayFlow.exe \
-            "$FIRST_BUILD_DIR/installer.exe" "${SECOND_INSTALLERS[0]}"
+            "$FIRST_BUILD_DIR/installer.exe" "$NSIS_OUTPUT"
 
       - name: Audit Wails-generated changes
         working-directory: source/cmd/jayflow
