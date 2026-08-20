@@ -298,7 +298,6 @@ jobs:
           NSIS_PROJECT="build/windows/installer/project.nsi"
           NSIS_TOOLS="build/windows/installer/wails_tools.nsh"
           NSIS_BOOTSTRAPPER="build/windows/installer/tmp/MicrosoftEdgeWebview2Setup.exe"
-          NSIS_OUTPUT="build/bin/JayFlow-amd64-installer.exe"
 
           audit_nsis_project() {
             for GENERATED_INPUT in "$NSIS_PROJECT" "$NSIS_TOOLS" "$NSIS_BOOTSTRAPPER"; do
@@ -352,10 +351,14 @@ jobs:
           mkdir "$FIRST_BUILD_DIR"
           rm -rf -- build/bin
           build_windows_app -nsis
-          if [ ! -f "$NSIS_OUTPUT" ]; then
-            echo "::error::initial Wails NSIS generation did not produce its disposable installer"
+          mapfile -d '' -t NSIS_OUTPUTS \
+            < <(find build/bin -maxdepth 1 -type f -name '*-amd64-installer.exe' -print0)
+          if [ "${#NSIS_OUTPUTS[@]}" -ne 1 ]; then
+            echo "::error::initial Wails NSIS generation must produce exactly one disposable amd64 installer"
+            printf 'Installer candidate: %s\n' "${NSIS_OUTPUTS[@]:-none}" >&2
             exit 1
           fi
+          NSIS_OUTPUT="${NSIS_OUTPUTS[0]}"
           if grep -qE '^[[:space:]]*SetDateSave([[:space:]]|$)' "$NSIS_PROJECT"; then
             echo "::error::Wails-generated project.nsi unexpectedly already controls SetDateSave"
             exit 1

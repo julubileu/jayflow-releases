@@ -356,7 +356,10 @@ if not marker:
     raise SystemExit("Windows build step does not define the reproducible app build function")
 with tempfile.TemporaryDirectory() as temp_dir:
     config = pathlib.Path(temp_dir, "wails.json")
-    config.write_text('{"info":{"productName":"JayFlow","productVersion":"2.0.0-dev"}}\n', encoding="utf-8")
+    config.write_text(
+        '{"name":"jayflow","info":{"productName":"JayFlow","productVersion":"2.0.0-dev"}}\n',
+        encoding="utf-8",
+    )
     env = safe_env.copy()
     env.update({"VERSION": "2.0.33-dev", "PUBLIC_KEY": "test-public-key"})
     result = checked(["bash", "-c", stamp_prefix], cwd=temp_dir, env=env)
@@ -380,7 +383,10 @@ for required in (
     'NSIS_PROJECT="build/windows/installer/project.nsi"',
     'NSIS_TOOLS="build/windows/installer/wails_tools.nsh"',
     'NSIS_BOOTSTRAPPER="build/windows/installer/tmp/MicrosoftEdgeWebview2Setup.exe"',
-    'NSIS_OUTPUT="build/bin/JayFlow-amd64-installer.exe"',
+    "mapfile -d '' -t NSIS_OUTPUTS",
+    "find build/bin -maxdepth 1 -type f -name '*-amd64-installer.exe' -print0",
+    'if [ "${#NSIS_OUTPUTS[@]}" -ne 1 ]; then',
+    'NSIS_OUTPUT="${NSIS_OUTPUTS[0]}"',
     "stamp_windows_metadata",
     "build_windows_app",
     "make_nsis",
@@ -394,6 +400,12 @@ for required in (
 ):
     if required not in stamp_script:
         raise SystemExit(f"Windows reproducibility proof is missing {required}")
+if re.search(r'build/bin/[^\s"\']*-amd64-installer\.exe', stamp_script):
+    raise SystemExit("Windows NSIS output must be discovered without hardcoded project-name casing")
+if stamp_script.count("-name '*-amd64-installer.exe'") != 1:
+    raise SystemExit("Windows NSIS output must use exactly one case-sensitive filename search")
+if re.search(r'find[^\n]*[ \t]-iname(?:[ \t]|$)', stamp_script):
+    raise SystemExit("Windows NSIS output discovery must not use case-insensitive matching")
 if len(re.findall(r"^build_windows_app(?: -nsis)?$", stamp_script, re.MULTILINE)) != 2:
     raise SystemExit("Windows app must be built exactly twice")
 if len(re.findall(r"^build_windows_app -nsis$", stamp_script, re.MULTILINE)) != 1:
@@ -413,6 +425,8 @@ if "touch " in stamp_script or "SOURCE_DATE_EPOCH=" in stamp_script:
 if len(re.findall(r"^stamp_windows_metadata$", stamp_script, re.MULTILINE)) != 2:
     raise SystemExit("both Windows builds must start from the same metadata stamp")
 first_build = stamp_script.index("\nbuild_windows_app -nsis\n")
+discover_output = stamp_script.index("mapfile -d '' -t NSIS_OUTPUTS")
+select_output = stamp_script.index('NSIS_OUTPUT="${NSIS_OUTPUTS[0]}"')
 date_save = stamp_script.index("sed -i '1a SetDateSave off'")
 first_makensis = stamp_script.index("\nmake_nsis\n")
 preserve_first = stamp_script.index('cp "$NSIS_OUTPUT" "$FIRST_BUILD_DIR/installer.exe"')
@@ -423,7 +437,7 @@ second_makensis = stamp_script.rindex("\nmake_nsis\n")
 compare_app = stamp_script.index('cmp -s "$FIRST_BUILD_DIR/JayFlow.exe" build/bin/JayFlow.exe')
 compare_installer = stamp_script.index('cmp -s "$FIRST_BUILD_DIR/installer.exe" "$NSIS_OUTPUT"')
 if not (
-    first_build < date_save < first_makensis < preserve_first < restore < second_stamp
+    first_build < discover_output < select_output < date_save < first_makensis < preserve_first < restore < second_stamp
     < second_build < second_makensis < compare_app < compare_installer
 ):
     raise SystemExit("Windows app/NSIS generation, preservation, and comparison order is wrong")
@@ -437,7 +451,7 @@ with tempfile.TemporaryDirectory() as temp_dir_text:
         "fixture\n", encoding="utf-8"
     )
     (project_dir / "wails.json").write_text(
-        '{"info":{"productName":"JayFlow","productVersion":"2.0.0-dev"}}\n',
+        '{"name":"jayflow","info":{"productName":"JayFlow","productVersion":"2.0.0-dev"}}\n',
         encoding="utf-8",
     )
     fake_bin = temp_dir / "fake-bin"
@@ -467,6 +481,7 @@ binary.write_bytes(b"identical JayFlow app bytes\n")
 mtime = 1700000000 + count
 os.utime(binary, (mtime, mtime))
 if "-nsis" in sys.argv[1:]:
+    project_name = json.loads((root / "wails.json").read_text(encoding="utf-8"))["name"]
     installer = root / "build" / "windows" / "installer"
     (installer / "tmp").mkdir(parents=True, exist_ok=True)
     (installer / "project.nsi").write_text(
@@ -487,9 +502,16 @@ if "-nsis" in sys.argv[1:]:
     (installer / "tmp" / "MicrosoftEdgeWebview2Setup.exe").write_bytes(
         b"webview bootstrapper bytes\n"
     )
-    (root / "build" / "bin" / "JayFlow-amd64-installer.exe").write_bytes(
-        b"automatic Wails installer must be discarded\n"
-    )
+    output_count = int(os.environ.get("FAKE_WAILS_INSTALLER_COUNT", "1"))
+    for index in range(output_count):
+        output_name = (
+            f"{project_name}-amd64-installer.exe"
+            if index == 0
+            else f"extra-{index}-amd64-installer.exe"
+        )
+        (root / "build" / "bin" / output_name).write_bytes(
+            b"automatic Wails installer must be discarded\n"
+        )
 ''', encoding="utf-8")
     fake_wails.chmod(0o755)
 
@@ -534,7 +556,9 @@ for required_file in (
 binary = pathlib.Path("../../bin/JayFlow.exe")
 body = binary.read_bytes()
 digest = hashlib.sha256(b"manual-nsis\0" + body).digest()
-pathlib.Path("../../bin/JayFlow-amd64-installer.exe").write_bytes(digest)
+project_root = pathlib.Path.cwd().parents[2]
+project_name = json.loads((project_root / "wails.json").read_text(encoding="utf-8"))["name"]
+(project_root / "build" / "bin" / f"{project_name}-amd64-installer.exe").write_bytes(digest)
 ''', encoding="utf-8")
     fake_makensis.chmod(0o755)
 
@@ -553,6 +577,22 @@ pathlib.Path("../../bin/JayFlow-amd64-installer.exe").write_bytes(digest)
         "FAKE_WAILS_COUNT": str(temp_dir / "wails-count"),
     })
     pathlib.Path(env["RUNNER_TEMP"]).mkdir()
+    for installer_count in ("0", "2"):
+        env["FAKE_WAILS_INSTALLER_COUNT"] = installer_count
+        result = checked(["bash", "-c", stamp_script], cwd=project_dir, env=env)
+        if result.returncode == 0:
+            raise SystemExit(
+                f"behavioral workflow accepted {installer_count} Wails installer candidates"
+            )
+        if "must produce exactly one disposable amd64 installer" not in (result.stdout + result.stderr):
+            raise SystemExit(
+                f"behavioral workflow failed incorrectly for {installer_count} installer candidates"
+            )
+        shutil.rmtree(project_dir / "build", ignore_errors=True)
+        shutil.rmtree(pathlib.Path(env["RUNNER_TEMP"]) / "first-windows-build")
+        call_log.unlink()
+        pathlib.Path(env["FAKE_WAILS_COUNT"]).unlink()
+    env["FAKE_WAILS_INSTALLER_COUNT"] = "1"
     result = checked(["bash", "-c", stamp_script], cwd=project_dir, env=env)
     require_success(result, "behavioral Windows/NSIS reproducibility workflow")
 
@@ -575,7 +615,10 @@ pathlib.Path("../../bin/JayFlow-amd64-installer.exe").write_bytes(digest)
     if any(call["source_date_epoch"] != "1700000000" for call in makensis_calls):
         raise SystemExit("SOURCE_DATE_EPOCH did not reach both manual makensis builds")
     first_installer = pathlib.Path(env["RUNNER_TEMP"]) / "first-windows-build" / "installer.exe"
-    second_installer = project_dir / "build" / "bin" / "JayFlow-amd64-installer.exe"
+    second_installers = list((project_dir / "build" / "bin").glob("*-amd64-installer.exe"))
+    if len(second_installers) != 1:
+        raise SystemExit("behavioral workflow did not leave exactly one amd64 installer")
+    second_installer = second_installers[0]
     if first_installer.read_bytes() != second_installer.read_bytes():
         raise SystemExit("behavioral workflow did not preserve/compare reproducible manual installers")
     if first_installer.read_bytes() == b"automatic Wails installer must be discarded\n":
