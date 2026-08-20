@@ -263,6 +263,7 @@ jobs:
         working-directory: source/cmd/jayflow
         env:
           VERSION: ${{ steps.inputs.outputs.version }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
           PUBLIC_KEY: ${{ vars.JAYFLOW_RELEASE_PUBLIC_KEY }}
         run: |
           set -euo pipefail
@@ -271,12 +272,16 @@ jobs:
             exit 1
           fi
           stamp_windows_metadata() {
-            node - "$VERSION" <<'NODE'
+            node - "$VERSION" "$SOURCE_SHA" <<'NODE'
           const fs = require('node:fs');
           const version = process.argv[2];
+          const sourceSHA = process.argv[3];
           const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-dev)?$/.exec(version);
           if (!match || match.slice(1, 4).some((value) => Number(value) > 65535)) {
             throw new Error('release version is outside the Windows X.Y.Z bounds');
+          }
+          if (!/^[0-9a-f]{40}$/.test(sourceSHA)) {
+            throw new Error('source SHA must be a lowercase 40-character commit SHA');
           }
           const productVersion = `${match[1]}.${match[2]}.${match[3]}`;
           const path = 'wails.json';
@@ -285,6 +290,7 @@ jobs:
             throw new Error('wails.json has no info object');
           }
           config.info.productVersion = productVersion;
+          config.info.comments = `source_sha=${sourceSHA}`;
           fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
           NODE
           }

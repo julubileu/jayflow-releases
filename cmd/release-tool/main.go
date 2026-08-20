@@ -39,7 +39,10 @@ const (
 	checksumsName        = "checksums.txt"
 )
 
-var strictVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-dev)?$`)
+var (
+	strictVersionPattern   = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-dev)?$`)
+	strictSourceSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+)
 
 type latestManifest struct {
 	Version string `json:"version"`
@@ -399,7 +402,7 @@ func auditWindows(dir, daemonPath, version, sourceRef, sourceSHA, publicKey stri
 	if err := requireGoTarget(info, "windows", "amd64"); err != nil {
 		return fmt.Errorf("portable: %w", err)
 	}
-	if err := requireVCSRevision(info, sourceSHA); err != nil {
+	if err := requirePortableSourceIdentity(body, info, sourceSHA); err != nil {
 		return fmt.Errorf("portable: %w", err)
 	}
 	if !bytes.Contains(body, []byte(version)) {
@@ -456,22 +459,76 @@ func validateSourceIdentity(version, sourceRef, sourceSHA string) error {
 	if sourceRef != "v"+version {
 		return fmt.Errorf("source ref is %q, want %q", sourceRef, "v"+version)
 	}
-	if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(sourceSHA) {
+	if !strictSourceSHAPattern.MatchString(sourceSHA) {
 		return errors.New("source SHA must be a lowercase 40-character commit SHA")
 	}
 	return nil
 }
 
-func requireVCSRevision(info *debug.BuildInfo, sourceSHA string) error {
+func requirePortableSourceIdentity(body []byte, info *debug.BuildInfo, sourceSHA string) error {
+	if err := requirePESourceMarker(body, sourceSHA); err != nil {
+		return err
+	}
+	if info == nil {
+		return errors.New("portable has nil Go build info")
+	}
 	for _, setting := range info.Settings {
 		if setting.Key == "vcs.revision" {
 			if setting.Value != sourceSHA {
 				return fmt.Errorf("Go vcs.revision is %q, want %q", setting.Value, sourceSHA)
 			}
-			return nil
 		}
 	}
-	return errors.New("Go build info has no vcs.revision")
+	return nil
+}
+
+func requirePESourceMarker(body []byte, sourceSHA string) error {
+	if !strictSourceSHAPattern.MatchString(sourceSHA) {
+		return errors.New("source SHA must be a lowercase 40-character commit SHA")
+	}
+	prefix := utf16LEASCII("source_sha=")
+	const shaLength = 40
+	valueBytes := shaLength * 2
+	foundMatching := false
+	for offset := 2; offset+len(prefix)+valueBytes+2 <= len(body); offset++ {
+		if body[offset-2] != 0 || body[offset-1] != 0 ||
+			!bytes.Equal(body[offset:offset+len(prefix)], prefix) {
+			continue
+		}
+		shaOffset := offset + len(prefix)
+		candidate := make([]byte, shaLength)
+		valid := true
+		for index := range candidate {
+			char := body[shaOffset+index*2]
+			if body[shaOffset+index*2+1] != 0 ||
+				!(char >= '0' && char <= '9' || char >= 'a' && char <= 'f') {
+				valid = false
+				break
+			}
+			candidate[index] = char
+		}
+		terminator := shaOffset + valueBytes
+		if !valid || body[terminator] != 0 || body[terminator+1] != 0 {
+			continue
+		}
+		if string(candidate) != sourceSHA {
+			return fmt.Errorf("PE source marker is %q, want %q",
+				"source_sha="+string(candidate), "source_sha="+sourceSHA)
+		}
+		foundMatching = true
+	}
+	if foundMatching {
+		return nil
+	}
+	return fmt.Errorf("PE has no exact UTF-16LE source marker %q", "source_sha="+sourceSHA)
+}
+
+func utf16LEASCII(value string) []byte {
+	encoded := make([]byte, len(value)*2)
+	for index := range value {
+		encoded[index*2] = value[index]
+	}
+	return encoded
 }
 
 func requireEmbeddedBlob(portable, daemon []byte) error {

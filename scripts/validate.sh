@@ -256,6 +256,11 @@ if "repository" in public_sign_checkout.get("with", {}):
 public_auditor_build = step_named(build_steps, "Build the trusted public auditor")
 if public_auditor_build.get("working-directory") != "release":
     raise SystemExit("build must compile the nested public Go module from working-directory release")
+source_info_template = source_repo / "cmd" / "jayflow" / "build" / "windows" / "info.json"
+if not source_info_template.is_file():
+    raise SystemExit("private source Windows info.json template is missing")
+if '"Comments": "{{.Info.Comments}}"' not in source_info_template.read_text(encoding="utf-8"):
+    raise SystemExit("private source Windows info.json does not expose Wails comments")
 
 upload = step_named(build_steps, "Upload the unsigned internal build artifact")
 download = step_named(sign_steps, "Download the unsigned internal build artifact")
@@ -351,22 +356,48 @@ for required in (
         raise SystemExit(f"source epoch is not commit-derived/exported: {required}")
 
 stamp_script = scripts["Build the stamped Windows app and NSIS installer twice"]
+stamp_step = step_named(build_steps, "Build the stamped Windows app and NSIS installer twice")
+if stamp_step.get("env", {}).get("SOURCE_SHA") != "${{ steps.source.outputs.sha }}":
+    raise SystemExit("Windows build SOURCE_SHA is not tied to the validated source step")
 stamp_prefix, marker, build_suffix = stamp_script.partition("\nbuild_windows_app()")
 if not marker:
     raise SystemExit("Windows build step does not define the reproducible app build function")
 with tempfile.TemporaryDirectory() as temp_dir:
     config = pathlib.Path(temp_dir, "wails.json")
     config.write_text(
-        '{"name":"jayflow","info":{"productName":"JayFlow","productVersion":"2.0.0-dev"}}\n',
+        '{"name":"jayflow","info":{"productName":"JayFlow","productVersion":"2.0.0-dev",'
+        '"comments":"untrusted source comment"}}\n',
         encoding="utf-8",
     )
     env = safe_env.copy()
-    env.update({"VERSION": "2.0.33-dev", "PUBLIC_KEY": "test-public-key"})
+    env.update({
+        "VERSION": "2.0.33-dev",
+        "SOURCE_SHA": "0123456789abcdef0123456789abcdef01234567",
+        "PUBLIC_KEY": "test-public-key",
+    })
+    for invalid_sha in (
+        "0123456789abcdef",
+        "0123456789ABCDEF0123456789ABCDEF01234567",
+        "g123456789abcdef0123456789abcdef01234567",
+    ):
+        env["SOURCE_SHA"] = invalid_sha
+        result = checked(["bash", "-c", stamp_prefix], cwd=temp_dir, env=env)
+        if result.returncode == 0:
+            raise SystemExit(f"Wails metadata stamp accepted invalid source SHA {invalid_sha!r}")
+    env["SOURCE_SHA"] = "0123456789abcdef0123456789abcdef01234567"
     result = checked(["bash", "-c", stamp_prefix], cwd=temp_dir, env=env)
     require_success(result, "Wails metadata stamping")
     stamped = json.loads(config.read_text(encoding="utf-8"))
     if stamped["info"]["productVersion"] != "2.0.33":
         raise SystemExit("Wails productVersion must be numeric X.Y.Z")
+    if stamped["info"].get("comments") != "source_sha=0123456789abcdef0123456789abcdef01234567":
+        raise SystemExit("Wails comments must overwrite source metadata with the validated SHA marker")
+comments_assignment = 'config.info.comments = `source_sha=${sourceSHA}`;'
+if comments_assignment not in stamp_prefix:
+    raise SystemExit("Windows metadata stamp does not assign the exact source SHA comments marker")
+first_stamp_call = stamp_script.index("\nstamp_windows_metadata\n")
+if stamp_script.index(comments_assignment) > first_stamp_call:
+    raise SystemExit("Wails comments source marker must be assigned before the first Wails build")
 if "wails build" not in build_suffix:
     raise SystemExit("Windows build step does not invoke Wails")
 if 'wails build "$@"' not in build_suffix:
@@ -437,7 +468,7 @@ second_makensis = stamp_script.rindex("\nmake_nsis\n")
 compare_app = stamp_script.index('cmp -s "$FIRST_BUILD_DIR/JayFlow.exe" build/bin/JayFlow.exe')
 compare_installer = stamp_script.index('cmp -s "$FIRST_BUILD_DIR/installer.exe" "$NSIS_OUTPUT"')
 if not (
-    first_build < discover_output < select_output < date_save < first_makensis < preserve_first < restore < second_stamp
+    first_stamp_call < first_build < discover_output < select_output < date_save < first_makensis < preserve_first < restore < second_stamp
     < second_build < second_makensis < compare_app < compare_installer
 ):
     raise SystemExit("Windows app/NSIS generation, preservation, and comparison order is wrong")
@@ -451,7 +482,8 @@ with tempfile.TemporaryDirectory() as temp_dir_text:
         "fixture\n", encoding="utf-8"
     )
     (project_dir / "wails.json").write_text(
-        '{"name":"jayflow","info":{"productName":"JayFlow","productVersion":"2.0.0-dev"}}\n',
+        '{"name":"jayflow","info":{"productName":"JayFlow","productVersion":"2.0.0-dev",'
+        '"comments":"untrusted source comment"}}\n',
         encoding="utf-8",
     )
     fake_bin = temp_dir / "fake-bin"
@@ -471,6 +503,7 @@ with pathlib.Path(os.environ["FAKE_BUILD_LOG"]).open("a", encoding="utf-8") as h
         "tool": "wails",
         "args": sys.argv[1:],
         "source_date_epoch": os.environ.get("SOURCE_DATE_EPOCH"),
+        "source_marker": json.loads((root / "wails.json").read_text(encoding="utf-8"))["info"].get("comments"),
     }) + "\n")
 count_file = pathlib.Path(os.environ["FAKE_WAILS_COUNT"])
 count = int(count_file.read_text(encoding="utf-8")) + 1 if count_file.exists() else 1
@@ -570,6 +603,7 @@ project_name = json.loads((project_root / "wails.json").read_text(encoding="utf-
     env.update({
         "PATH": f"{fake_bin}:{safe_env['PATH']}",
         "VERSION": "2.0.33-dev",
+        "SOURCE_SHA": "0123456789abcdef0123456789abcdef01234567",
         "PUBLIC_KEY": "test-public-key",
         "RUNNER_TEMP": str(temp_dir / "runner-temp"),
         "SOURCE_DATE_EPOCH": "1700000000",
@@ -610,6 +644,8 @@ project_name = json.loads((project_root / "wails.json").read_text(encoding="utf-
         raise SystemExit("both Wails app builds must use identical arguments except for first-build -nsis")
     if any(call["source_date_epoch"] != "1700000000" for call in wails_calls):
         raise SystemExit("SOURCE_DATE_EPOCH did not reach both Wails app builds")
+    if any(call["source_marker"] != "source_sha=0123456789abcdef0123456789abcdef01234567" for call in wails_calls):
+        raise SystemExit("validated source marker did not reach both Wails app builds")
     if len(makensis_calls) != 2:
         raise SystemExit("behavioral workflow did not execute manual makensis twice")
     if any(call["source_date_epoch"] != "1700000000" for call in makensis_calls):

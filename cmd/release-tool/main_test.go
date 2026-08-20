@@ -339,19 +339,62 @@ func TestBuildinfoRecordsExactTagSHAAndWindowsInstallMetadata(t *testing.T) {
 	}
 }
 
-func TestPortableGoRevisionMustMatchExpectedSourceSHA(t *testing.T) {
+func TestPortableSourceIdentityRequiresExactPEMarkerAndChecksOptionalGoRevision(t *testing.T) {
 	const sourceSHA = "0123456789abcdef0123456789abcdef01234567"
-	info := &debug.BuildInfo{Settings: []debug.BuildSetting{
+	const differentSHA = "ffffffffffffffffffffffffffffffffffffffff"
+	matchingMarker := testPEString("source_sha=" + sourceSHA)
+	differentMarker := testPEString("source_sha=" + differentSHA)
+	matchingRevision := &debug.BuildInfo{Settings: []debug.BuildSetting{
 		{Key: "vcs.revision", Value: sourceSHA},
 	}}
-	if err := requireVCSRevision(info, sourceSHA); err != nil {
-		t.Fatalf("requireVCSRevision(matching) error = %v", err)
+	differentRevision := &debug.BuildInfo{Settings: []debug.BuildSetting{
+		{Key: "vcs.revision", Value: differentSHA},
+	}}
+
+	tests := []struct {
+		name    string
+		body    []byte
+		info    *debug.BuildInfo
+		wantErr bool
+	}{
+		{name: "marker absent and vcs absent", body: []byte("PE fixture"), info: &debug.BuildInfo{}, wantErr: true},
+		{name: "marker divergent and vcs absent", body: differentMarker, info: &debug.BuildInfo{}, wantErr: true},
+		{name: "marker exact and vcs absent", body: matchingMarker, info: &debug.BuildInfo{}},
+		{name: "marker exact and vcs present equal", body: matchingMarker, info: matchingRevision},
+		{name: "marker exact and vcs present divergent", body: matchingMarker, info: differentRevision, wantErr: true},
 	}
-	if err := requireVCSRevision(info, "ffffffffffffffffffffffffffffffffffffffff"); err == nil {
-		t.Fatal("requireVCSRevision() accepted a different source SHA")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := requirePortableSourceIdentity(test.body, test.info, sourceSHA)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("requirePortableSourceIdentity() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
 	}
-	if err := requireVCSRevision(&debug.BuildInfo{}, sourceSHA); err == nil {
-		t.Fatal("requireVCSRevision() accepted missing vcs.revision")
+}
+
+func TestPESourceMarkerIsStrictUTF16LEString(t *testing.T) {
+	const sourceSHA = "0123456789abcdef0123456789abcdef01234567"
+	valid := testPEString("source_sha=" + sourceSHA)
+	if err := requirePESourceMarker(valid, sourceSHA); err != nil {
+		t.Fatalf("requirePESourceMarker(valid) error = %v", err)
+	}
+
+	for name, body := range map[string][]byte{
+		"ASCII marker":             []byte("\x00source_sha=" + sourceSHA + "\x00"),
+		"uppercase SHA":            testPEString("source_sha=0123456789ABCDEF0123456789ABCDEF01234567"),
+		"short SHA":                testPEString("source_sha=0123456789abcdef"),
+		"extra hex digit":          testPEString("source_sha=" + sourceSHA + "a"),
+		"missing leading boundary": append([]byte{1, 0}, valid[2:]...),
+		"missing NUL terminator":   valid[:len(valid)-2],
+		"matching plus divergent marker": append(append([]byte(nil), valid...),
+			testPEString("source_sha=ffffffffffffffffffffffffffffffffffffffff")...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := requirePESourceMarker(body, sourceSHA); err == nil {
+				t.Fatal("requirePESourceMarker() accepted a non-exact PE string marker")
+			}
+		})
 	}
 }
 
@@ -481,6 +524,27 @@ func TestAuditWindowsAdversarialRealBinaries(t *testing.T) {
 		}
 	})
 
+	t.Run("source marker absent", func(t *testing.T) {
+		dist := cloneDirectory(t, fixture.dist)
+		portablePath := filepath.Join(dist, "JayFlow-"+fixture.version+".exe")
+		replacePortableMarker(t, portablePath, fixture.sourceSHA, "")
+		badArgs := replaceArgument(args, "-dir", dist)
+		if err := run(badArgs); err == nil {
+			t.Fatal("audit-windows accepted a portable without the PE source marker")
+		}
+	})
+
+	t.Run("source marker divergence", func(t *testing.T) {
+		dist := cloneDirectory(t, fixture.dist)
+		portablePath := filepath.Join(dist, "JayFlow-"+fixture.version+".exe")
+		replacePortableMarker(t, portablePath, fixture.sourceSHA,
+			"ffffffffffffffffffffffffffffffffffffffff")
+		badArgs := replaceArgument(args, "-dir", dist)
+		if err := run(badArgs); err == nil {
+			t.Fatal("audit-windows accepted a divergent PE source marker")
+		}
+	})
+
 	t.Run("symlink daemon", func(t *testing.T) {
 		link := filepath.Join(t.TempDir(), "jayflowd")
 		if err := os.Symlink(fixture.daemon, link); err != nil {
@@ -587,7 +651,8 @@ func main() {
 	if err := os.Mkdir(dist, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	portable := append(append([]byte(nil), baseBody...), marker...)
+	portable := append(append([]byte(nil), baseBody...), testPEString("source_sha="+sourceSHA)...)
+	portable = append(portable, marker...)
 	if err := os.WriteFile(filepath.Join(dist, "JayFlow-"+version+".exe"), portable, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -630,6 +695,35 @@ func main() {
 	return windowsAuditFixture{
 		version: version, dist: dist, daemon: daemon, sourceRef: sourceRef,
 		sourceSHA: sourceSHA, publicKey: publicKey,
+	}
+}
+
+func testPEString(value string) []byte {
+	body := make([]byte, 2, 2+2*len(value)+2)
+	for _, char := range []byte(value) {
+		body = append(body, char, 0)
+	}
+	return append(body, 0, 0)
+}
+
+func replacePortableMarker(t *testing.T, path, oldSHA, newSHA string) {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldMarker := testPEString("source_sha=" + oldSHA)
+	offset := bytes.Index(body, oldMarker)
+	if offset < 0 {
+		t.Fatal("test fixture has no source marker to replace")
+	}
+	replacement := make([]byte, len(oldMarker))
+	if newSHA != "" {
+		replacement = testPEString("source_sha=" + newSHA)
+	}
+	copy(body[offset:offset+len(oldMarker)], replacement)
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 
