@@ -4,34 +4,39 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Matching v<VERSION> tag (short or refs/tags/) or full 40-character commit SHA
+        description: Exact matching v<VERSION> tag
         required: true
         default: v2.0.33-dev
         type: string
       version:
-        description: Version without v prefix (X.Y.Z or X.Y.Z-dev)
+        description: Version without v prefix (X.Y.Z or X.Y.Z-dev; each Windows component <= 65535)
         required: true
         default: 2.0.33-dev
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: public-release
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Validate, build, sign, and publish
+  build:
+    name: Validate and build without the signing key
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    env:
-      GH_REPO: julubileu/jayflow-releases
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.inputs.outputs.version }}
+      ref: ${{ steps.inputs.outputs.ref }}
+      source_sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Check out the public release repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          path: release
           persist-credentials: false
 
       - name: Validate release inputs
@@ -46,20 +51,26 @@ jobs:
             echo "::error::version must be X.Y.Z or X.Y.Z-dev, without a v prefix or leading zeroes"
             exit 1
           fi
+          VERSION_CORE="${INPUT_VERSION%-dev}"
+          IFS=. read -r VERSION_MAJOR VERSION_MINOR VERSION_PATCH <<< "$VERSION_CORE"
+          for COMPONENT in "$VERSION_MAJOR" "$VERSION_MINOR" "$VERSION_PATCH"; do
+            if [ "${#COMPONENT}" -gt 5 ] || (( 10#$COMPONENT > 65535 )); then
+              echo "::error::each Windows version component must be in 0..65535"
+              exit 1
+            fi
+          done
 
           EXPECTED_TAG="v${INPUT_VERSION}"
-          if [[ ! "$INPUT_REF" =~ ^[0-9a-fA-F]{40}$ ]] \
-            && [[ "$INPUT_REF" != "$EXPECTED_TAG" ]] \
-            && [[ "$INPUT_REF" != "refs/tags/${EXPECTED_TAG}" ]]; then
-            echo "::error::ref must match v${INPUT_VERSION}, refs/tags/v${INPUT_VERSION}, or be a full 40-character commit SHA"
+          if [ "$INPUT_REF" != "$EXPECTED_TAG" ]; then
+            echo "::error::ref must be exactly v${INPUT_VERSION}"
             exit 1
           fi
 
           printf 'version=%s\n' "$INPUT_VERSION" >> "$GITHUB_OUTPUT"
-          printf 'ref=%s\n' "$INPUT_REF" >> "$GITHUB_OUTPUT"
+          printf 'ref=%s\n' "$EXPECTED_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Check out the private source at the validated ref
-        uses: actions/checkout@v4
+      - name: Check out the private source at the validated tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: julubileu/jayflow-v2
           ref: ${{ steps.inputs.outputs.ref }}
@@ -67,7 +78,7 @@ jobs:
           path: source
           persist-credentials: false
 
-      - name: Record source identity
+      - name: Record and verify source identity
         id: source
         working-directory: source
         env:
@@ -75,29 +86,57 @@ jobs:
         run: |
           set -euo pipefail
           SOURCE_SHA="$(git rev-parse HEAD)"
-          test "${#SOURCE_SHA}" -eq 40
+          TAG_SHA="$(git rev-parse --verify "refs/tags/${SOURCE_REF}^{commit}")"
+          if [ "$SOURCE_SHA" != "$TAG_SHA" ] || [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::checkout HEAD does not resolve from the exact requested tag"
+            exit 1
+          fi
           printf 'sha=%s\n' "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
-          printf 'ref=%s\n' "$SOURCE_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Derive the reproducible source epoch
+        working-directory: source
+        run: |
+          set -euo pipefail
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$SOURCE_SHA")"
+          if [[ ! "$SOURCE_DATE_EPOCH" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::source commit has no valid positive commit epoch"
+            exit 1
+          fi
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$SOURCE_DATE_EPOCH" >> "$GITHUB_ENV"
 
       - name: Set up Go from the private source go.mod
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version-file: source/go.mod
           cache: true
           cache-dependency-path: source/go.sum
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: source/cmd/jayflow/frontend/package-lock.json
 
+      - name: Build the trusted public auditor
+        working-directory: release
+        run: |
+          set -euo pipefail
+          go test ./cmd/release-tool
+          go build -trimpath -o "$RUNNER_TEMP/jayflow-release-tool" ./cmd/release-tool
+
       - name: Install NSIS and expose the runner browser as Chromium
         run: |
           set -euo pipefail
+          NSIS_PACKAGE_VERSION=3.09-4ubuntu1
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends nsis
+          sudo apt-get install -y --no-install-recommends "nsis=$NSIS_PACKAGE_VERSION"
+          if [ "$(dpkg-query -W -f='${Version}' nsis)" != "$NSIS_PACKAGE_VERSION" ]; then
+            echo "::error::installed NSIS package differs from the pinned Ubuntu 24.04 version"
+            exit 1
+          fi
+          makensis -VERSION
 
           CHROMIUM_SOURCE=""
           for CANDIDATE in \
@@ -125,6 +164,19 @@ jobs:
           npm ci --prefix cmd/jayflow/frontend --ignore-scripts --no-audit --no-fund
           go install github.com/wailsapp/wails/v2/cmd/wails@v2.14.0
           printf '%s\n' "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Audit pinned Wails NSIS user-scope semantics
+        working-directory: source
+        run: |
+          set -euo pipefail
+          WAILS_ROOT="$(go env GOPATH)/pkg/mod/github.com/wailsapp/wails/v2@v2.14.0"
+          NSIS_BUILDER="$WAILS_ROOT/pkg/commands/build/nsis_installer.go"
+          NSIS_TEMPLATE="$WAILS_ROOT/pkg/buildassets/build/windows/installer/project.nsi"
+          grep -Fq 'args = append(args, "-DWAILS_INSTALL_SCOPE=user")' "$NSIS_BUILDER"
+          grep -Fq 'args = append(args, "-DREQUEST_EXECUTION_LEVEL=user")' "$NSIS_BUILDER"
+          grep -Fq 'InstallDir "$LOCALAPPDATA\Programs\${INFO_PRODUCTNAME}"' "$NSIS_TEMPLATE"
+          grep -Fq 'VIProductVersion "${INFO_PRODUCTVERSION}.0"' "$NSIS_TEMPLATE"
+          grep -Fq 'VIFileVersion    "${INFO_PRODUCTVERSION}.0"' "$NSIS_TEMPLATE"
 
       - name: Gate 1 - release regression
         working-directory: source
@@ -192,32 +244,7 @@ jobs:
           trap 'rm -rf "$SHOTS_DIR"' EXIT
           node scripts/mobile-shots.mjs "$SHOTS_DIR"
 
-      - name: Derive and verify the release public key
-        id: signing
-        working-directory: source
-        env:
-          JAYFLOW_RELEASE_PRIVATE_KEY: ${{ secrets.JAYFLOW_RELEASE_PRIVATE_KEY }}
-          EXPECTED_PUBLIC_KEY: ${{ vars.JAYFLOW_RELEASE_PUBLIC_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "${JAYFLOW_RELEASE_PRIVATE_KEY:-}" ]; then
-            echo "::error::JAYFLOW_RELEASE_PRIVATE_KEY is not configured"
-            exit 1
-          fi
-          if [ -z "${EXPECTED_PUBLIC_KEY:-}" ]; then
-            echo "::error::JAYFLOW_RELEASE_PUBLIC_KEY is not configured"
-            exit 1
-          fi
-
-          PUBLIC_KEY="$(go run ./internal/updater/signtool -pubkey)"
-          echo "::add-mask::$PUBLIC_KEY"
-          if [ "$PUBLIC_KEY" != "$EXPECTED_PUBLIC_KEY" ]; then
-            echo "::error::the signing secret does not derive the configured release public key"
-            exit 1
-          fi
-          printf 'public_key=%s\n' "$PUBLIC_KEY" >> "$GITHUB_OUTPUT"
-
-      - name: Build the embedded Linux daemon
+      - name: Build and audit the embedded Linux daemon
         working-directory: source
         env:
           VERSION: ${{ steps.inputs.outputs.version }}
@@ -227,32 +254,79 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
             -ldflags "-s -w -X main.Version=${VERSION}" \
             -o cmd/jayflow/embedded/jayflowd ./cmd/jayflowd
+          "$RUNNER_TEMP/jayflow-release-tool" audit-daemon \
+            -version "$VERSION" \
+            -path cmd/jayflow/embedded/jayflowd
 
-      - name: Build the stamped Windows app and NSIS installer
+      - name: Build the stamped Windows app and NSIS installer twice
         working-directory: source/cmd/jayflow
         env:
           VERSION: ${{ steps.inputs.outputs.version }}
-          PUBLIC_KEY: ${{ steps.signing.outputs.public_key }}
+          PUBLIC_KEY: ${{ vars.JAYFLOW_RELEASE_PUBLIC_KEY }}
         run: |
           set -euo pipefail
-          node - "$VERSION" <<'NODE'
+          if [ -z "$PUBLIC_KEY" ]; then
+            echo "::error::JAYFLOW_RELEASE_PUBLIC_KEY is not configured"
+            exit 1
+          fi
+          stamp_windows_metadata() {
+            node - "$VERSION" <<'NODE'
           const fs = require('node:fs');
           const version = process.argv[2];
           const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-dev)?$/.exec(version);
-          if (!match) {
-            throw new Error('release version is not X.Y.Z or X.Y.Z-dev');
+          if (!match || match.slice(1, 4).some((value) => Number(value) > 65535)) {
+            throw new Error('release version is outside the Windows X.Y.Z bounds');
           }
-          const windowsVersion = `${match[1]}.${match[2]}.${match[3]}.0`;
+          const productVersion = `${match[1]}.${match[2]}.${match[3]}`;
           const path = 'wails.json';
           const config = JSON.parse(fs.readFileSync(path, 'utf8'));
           if (!config.info || typeof config.info !== 'object') {
             throw new Error('wails.json has no info object');
           }
-          config.info.productVersion = windowsVersion;
+          config.info.productVersion = productVersion;
           fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
           NODE
-          wails build -platform windows/amd64 -webview2 download -nsis -installscope user -trimpath \
-            -ldflags "-X main.DaemonVersion=${VERSION} -X main.AppVersion=${VERSION} -X github.com/julubileu/jayflow-v2/internal/updater.PublicKeyBase64=${PUBLIC_KEY}"
+          }
+
+          stamp_windows_metadata
+          build_windows() {
+            wails build -platform windows/amd64 -webview2 download -nsis -installscope user -trimpath \
+              -ldflags "-X main.DaemonVersion=${VERSION} -X main.AppVersion=${VERSION} -X github.com/julubileu/jayflow-v2/internal/updater.PublicKeyBase64=${PUBLIC_KEY}"
+          }
+
+          FIRST_BUILD_DIR="$RUNNER_TEMP/first-windows-build"
+          mkdir "$FIRST_BUILD_DIR"
+          rm -rf -- build/bin
+          build_windows
+          mapfile -d '' -t FIRST_INSTALLERS \
+            < <(find build/bin -maxdepth 1 -type f -name '*-amd64-installer.exe' -print0)
+          if [ "${#FIRST_INSTALLERS[@]}" -ne 1 ]; then
+            echo "::error::first Wails build did not produce exactly one amd64 NSIS installer"
+            exit 1
+          fi
+          cp build/bin/JayFlow.exe "$FIRST_BUILD_DIR/JayFlow.exe"
+          cp "${FIRST_INSTALLERS[0]}" "$FIRST_BUILD_DIR/installer.exe"
+
+          git restore --worktree -- wails.json frontend/wailsjs/go/models.ts
+          stamp_windows_metadata
+          rm -rf -- build/bin
+          build_windows
+          mapfile -d '' -t SECOND_INSTALLERS \
+            < <(find build/bin -maxdepth 1 -type f -name '*-amd64-installer.exe' -print0)
+          if [ "${#SECOND_INSTALLERS[@]}" -ne 1 ]; then
+            echo "::error::second Wails build did not produce exactly one amd64 NSIS installer"
+            exit 1
+          fi
+          if ! cmp -s "$FIRST_BUILD_DIR/JayFlow.exe" build/bin/JayFlow.exe; then
+            echo "::error::portable Windows build is not byte-for-byte reproducible"
+            exit 1
+          fi
+          if ! cmp -s "$FIRST_BUILD_DIR/installer.exe" "${SECOND_INSTALLERS[0]}"; then
+            echo "::error::NSIS setup build is not byte-for-byte reproducible"
+            exit 1
+          fi
+          sha256sum "$FIRST_BUILD_DIR/JayFlow.exe" build/bin/JayFlow.exe \
+            "$FIRST_BUILD_DIR/installer.exe" "${SECOND_INSTALLERS[0]}"
 
       - name: Audit Wails-generated changes
         working-directory: source/cmd/jayflow
@@ -261,86 +335,314 @@ jobs:
           REPO_ROOT="$(git rev-parse --show-toplevel)"
           (
             cd "$REPO_ROOT"
-            mapfile -d '' -t CHANGED_FILES < <(git diff --name-only -z)
-            for CHANGED_FILE in "${CHANGED_FILES[@]}"; do
-              if git diff --quiet --ignore-all-space -- "$CHANGED_FILE"; then
-                git restore --worktree -- "$CHANGED_FILE"
-              fi
-            done
+            git restore --worktree -- cmd/jayflow/wails.json
+            sed -i 's/^[[:blank:]]*$//' cmd/jayflow/frontend/wailsjs/go/models.ts
             git diff --check
-          )
-          mapfile -d '' -t UNTRACKED_BINDINGS \
-            < <(git ls-files --others --exclude-standard -z -- frontend/wailsjs/go)
-          if [ "${#UNTRACKED_BINDINGS[@]}" -ne 0 ]; then
-            echo "::error::Wails generated untracked frontend bindings"
-            exit 1
-          fi
-          git diff --exit-code -- frontend/wailsjs/go
+            git diff --exit-code
 
-      - name: Stage and audit release assets
+            mapfile -d '' -t UNTRACKED_FILES \
+              < <(git ls-files --others --exclude-standard -z)
+            if [ "${#UNTRACKED_FILES[@]}" -ne 0 ]; then
+              echo "::error::Wails generated untracked non-ignored files"
+              printf 'untracked: %s\n' "${UNTRACKED_FILES[@]}" >&2
+              exit 1
+            fi
+          )
+
+      - name: Stage and audit the exact unsigned release assets
         working-directory: source
         env:
           VERSION: ${{ steps.inputs.outputs.version }}
-          SOURCE_REF: ${{ steps.source.outputs.ref }}
+          SOURCE_REF: ${{ steps.inputs.outputs.ref }}
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          PUBLIC_KEY: ${{ vars.JAYFLOW_RELEASE_PUBLIC_KEY }}
         run: |
           set -euo pipefail
-          mkdir -p dist
+          mkdir dist
           cp cmd/jayflow/build/bin/JayFlow.exe "dist/JayFlow-${VERSION}.exe"
 
-          INSTALLER="$(find cmd/jayflow/build/bin -maxdepth 1 -type f -name '*installer*.exe' -print -quit)"
-          if [ -z "$INSTALLER" ]; then
-            echo "::error::Wails did not produce an NSIS installer"
+          mapfile -d '' -t INSTALLERS \
+            < <(find cmd/jayflow/build/bin -maxdepth 1 -type f -name '*-amd64-installer.exe' -print0)
+          if [ "${#INSTALLERS[@]}" -ne 1 ]; then
+            echo "::error::Wails must produce exactly one amd64 NSIS installer"
+            printf 'installer candidate: %s\n' "${INSTALLERS[@]:-none}" >&2
             exit 1
           fi
-          cp "$INSTALLER" "dist/JayFlow-${VERSION}-setup.exe"
-          cp "$INSTALLER" "dist/JayFlow-setup.exe"
+          cp "${INSTALLERS[0]}" "dist/JayFlow-${VERSION}-setup.exe"
+          cp "${INSTALLERS[0]}" dist/JayFlow-setup.exe
 
-          printf 'version=%s\nsource_ref=%s\nsource_sha=%s\n' \
-            "$VERSION" "$SOURCE_REF" "$SOURCE_SHA" > dist/buildinfo.txt
+          WINDOWS_VERSION="${VERSION%-dev}.0"
+          printf 'version=%s\nsource_ref=%s\nsource_sha=%s\nwindows_file_version=%s\ninstall_scope=user\ninstall_dir=%%LOCALAPPDATA%%\\Programs\\JayFlow\n' \
+            "$VERSION" "$SOURCE_REF" "$SOURCE_SHA" "$WINDOWS_VERSION" > dist/buildinfo.txt
 
-      - name: Sign latest.json and create checksums
-        working-directory: source
+          mapfile -d '' -t ACTUAL_ASSETS < <(find dist -maxdepth 1 -type f -printf '%f\0' | sort -z)
+          EXPECTED_ASSETS=(
+            "JayFlow-${VERSION}-setup.exe"
+            "JayFlow-${VERSION}.exe"
+            JayFlow-setup.exe
+            buildinfo.txt
+          )
+          if [ "${ACTUAL_ASSETS[*]}" != "${EXPECTED_ASSETS[*]}" ]; then
+            echo "::error::unsigned artifact inventory differs from the exact allowlist"
+            printf 'actual: %s\n' "${ACTUAL_ASSETS[*]}" >&2
+            exit 1
+          fi
+          "$RUNNER_TEMP/jayflow-release-tool" audit-windows \
+            -version "$VERSION" \
+            -dir dist \
+            -daemon cmd/jayflow/embedded/jayflowd \
+            -source-ref "$SOURCE_REF" \
+            -source-sha "$SOURCE_SHA" \
+            -public-key "$PUBLIC_KEY"
+
+      - name: Upload the unsigned internal build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-release-assets
+          path: source/dist/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload the separately audited daemon artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: audited-embedded-daemon
+          path: source/cmd/jayflow/embedded/jayflowd
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  sign_publish:
+    name: Sign and publish without private source
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_REPO: julubileu/jayflow-releases
+    steps:
+      - name: Check out only the public release repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go for the trusted public tool
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test and compile the trusted public tool before secret injection
+        run: |
+          set -euo pipefail
+          go test ./cmd/release-tool
+          go build -trimpath -o "$RUNNER_TEMP/jayflow-release-tool" ./cmd/release-tool
+
+      - name: Download the unsigned internal build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-release-assets
+          path: dist
+
+      - name: Download the separate audited daemon artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: audited-embedded-daemon
+          path: internal-daemon
+
+      - name: Audit downloaded bytes before signing
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SOURCE_REF: ${{ needs.build.outputs.ref }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+          PUBLIC_KEY: ${{ vars.JAYFLOW_RELEASE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/jayflow-release-tool" audit-windows \
+            -version "$VERSION" \
+            -dir dist \
+            -daemon internal-daemon/jayflowd \
+            -source-ref "$SOURCE_REF" \
+            -source-sha "$SOURCE_SHA" \
+            -public-key "$PUBLIC_KEY"
+
+      - name: Derive and verify the release public key
+        id: signing
         env:
           JAYFLOW_RELEASE_PRIVATE_KEY: ${{ secrets.JAYFLOW_RELEASE_PRIVATE_KEY }}
-          VERSION: ${{ steps.inputs.outputs.version }}
+          EXPECTED_PUBLIC_KEY: ${{ vars.JAYFLOW_RELEASE_PUBLIC_KEY }}
         run: |
           set -euo pipefail
-          ARTIFACT_URL="https://github.com/julubileu/jayflow-releases/releases/download/v${VERSION}/JayFlow-${VERSION}.exe"
-          go run ./internal/updater/signtool \
+          if [ -z "${JAYFLOW_RELEASE_PRIVATE_KEY:-}" ] || [ -z "${EXPECTED_PUBLIC_KEY:-}" ]; then
+            echo "::error::release signing key or expected public key is not configured"
+            exit 1
+          fi
+          PUBLIC_KEY="$("$RUNNER_TEMP/jayflow-release-tool" pubkey)"
+          echo "::add-mask::$PUBLIC_KEY"
+          if [ "$PUBLIC_KEY" != "$EXPECTED_PUBLIC_KEY" ]; then
+            echo "::error::the signing key does not derive the configured public key"
+            exit 1
+          fi
+          printf 'public_key=%s\n' "$PUBLIC_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Sign final bytes and generate authenticated metadata
+        env:
+          JAYFLOW_RELEASE_PRIVATE_KEY: ${{ secrets.JAYFLOW_RELEASE_PRIVATE_KEY }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          PORTABLE_URL="https://github.com/julubileu/jayflow-releases/releases/download/v${VERSION}/JayFlow-${VERSION}.exe"
+          "$RUNNER_TEMP/jayflow-release-tool" sign-bundle \
             -version "$VERSION" \
-            -artifact "dist/JayFlow-${VERSION}.exe" \
-            -url "$ARTIFACT_URL" \
-            -out dist/latest.json
+            -dir dist \
+            -portable-url "$PORTABLE_URL"
 
-          (
-            cd dist
-            sha256sum \
-              "JayFlow-${VERSION}.exe" \
-              "JayFlow-${VERSION}-setup.exe" \
-              JayFlow-setup.exe \
-              latest.json \
-              buildinfo.txt > checksums.txt
-          )
+      - name: Verify signed final bundle without the private key
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          PUBLIC_KEY: ${{ steps.signing.outputs.public_key }}
+        run: |
+          set -euo pipefail
+          PORTABLE_URL="https://github.com/julubileu/jayflow-releases/releases/download/v${VERSION}/JayFlow-${VERSION}.exe"
+          "$RUNNER_TEMP/jayflow-release-tool" verify-bundle \
+            -version "$VERSION" \
+            -dir dist \
+            -portable-url "$PORTABLE_URL" \
+            -public-key "$PUBLIC_KEY"
 
-      - name: Create or update the public release
-        working-directory: source
+      - name: Create or reconcile the atomic public release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.inputs.outputs.version }}
-          SOURCE_REF: ${{ steps.source.outputs.ref }}
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          VERSION: ${{ needs.build.outputs.version }}
+          SOURCE_REF: ${{ needs.build.outputs.ref }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+          PUBLIC_KEY: ${{ steps.signing.outputs.public_key }}
         run: |
           set -euo pipefail
+          MIN_GH_VERSION=2.45.0
+          GH_VERSION="$(gh --version | sed -nE '1s/^gh version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')"
+          if [ -z "$GH_VERSION" ] || [ "$(printf '%s\n%s\n' "$MIN_GH_VERSION" "$GH_VERSION" | sort -V | head -n1)" != "$MIN_GH_VERSION" ]; then
+            echo "::error::gh ${MIN_GH_VERSION} or newer is required"
+            exit 1
+          fi
+
           TAG="v${VERSION}"
-          NOTES_FILE="dist/release-notes.md"
+          PORTABLE_URL="https://github.com/julubileu/jayflow-releases/releases/download/${TAG}/JayFlow-${VERSION}.exe"
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
           printf '%s\n\n%s\n%s\n%s\n' \
             "JayFlow ${VERSION}" \
-            "Signed update: Ed25519 manifest plus SHA-256 artifact digest." \
+            "Ed25519-authenticated SHA-256 metadata for the portable, both setup names, and buildinfo." \
             "Private source ref: ${SOURCE_REF}" \
             "Private source SHA: ${SOURCE_SHA}" > "$NOTES_FILE"
 
-          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+          EXPECTED_ASSETS=(
+            "JayFlow-${VERSION}.exe"
+            "JayFlow-${VERSION}-setup.exe"
+            JayFlow-setup.exe
+            buildinfo.txt
+            release-manifest.json
+            release-manifest.sig
+            checksums.txt
+            latest.json
+          )
+          NON_LATEST_ASSETS=(
+            "dist/JayFlow-${VERSION}.exe"
+            "dist/JayFlow-${VERSION}-setup.exe"
+            dist/JayFlow-setup.exe
+            dist/buildinfo.txt
+            dist/release-manifest.json
+            dist/release-manifest.sig
+            dist/checksums.txt
+          )
+
+          read_release() {
+            local VIEW_ERROR="$RUNNER_TEMP/gh-release-view.err"
+            local VIEW_STATUS=0
+            RELEASE_JSON="$(gh release view "$TAG" --repo "$GH_REPO" --json isDraft,assets 2>"$VIEW_ERROR")" \
+              || VIEW_STATUS=$?
+            if [ "$VIEW_STATUS" -ne 0 ]; then
+              if [ "$VIEW_STATUS" -eq 1 ] && grep -Fiq 'release not found' "$VIEW_ERROR"; then
+                return 2
+              fi
+              cat "$VIEW_ERROR" >&2
+              return "$VIEW_STATUS"
+            fi
+            RELEASE_IS_DRAFT="$(RELEASE_JSON="$RELEASE_JSON" python3 -c 'import json,os; print(str(json.loads(os.environ["RELEASE_JSON"])["isDraft"]).lower())')"
+            mapfile -t RELEASE_ASSETS < <(RELEASE_JSON="$RELEASE_JSON" python3 -c 'import json,os,sys; sys.stdout.write("\n".join(asset["name"] for asset in json.loads(os.environ["RELEASE_JSON"])["assets"]))')
+            if [ "$RELEASE_IS_DRAFT" != true ] && [ "$RELEASE_IS_DRAFT" != false ]; then
+              echo "::error::could not determine whether ${TAG} is a draft"
+              exit 1
+            fi
+          }
+
+          asset_is_expected() {
+            local CANDIDATE="$1"
+            local EXPECTED
+            for EXPECTED in "${EXPECTED_ASSETS[@]}"; do
+              [ "$CANDIDATE" = "$EXPECTED" ] && return 0
+            done
+            return 1
+          }
+
+          reject_unexpected_assets() {
+            local ASSET
+            for ASSET in "${RELEASE_ASSETS[@]}"; do
+              if ! asset_is_expected "$ASSET"; then
+                echo "::error::release ${TAG} contains unexpected asset ${ASSET}"
+                exit 1
+              fi
+            done
+          }
+
+          require_exact_assets() {
+            reject_unexpected_assets
+            local EXPECTED
+            for EXPECTED in "${EXPECTED_ASSETS[@]}"; do
+              local FOUND=false
+              local ASSET
+              for ASSET in "${RELEASE_ASSETS[@]}"; do
+                [ "$ASSET" = "$EXPECTED" ] && FOUND=true
+              done
+              if [ "$FOUND" != true ]; then
+                echo "::error::release ${TAG} is missing expected asset ${EXPECTED}"
+                exit 1
+              fi
+            done
+            if [ "${#RELEASE_ASSETS[@]}" -ne "${#EXPECTED_ASSETS[@]}" ]; then
+              echo "::error::release ${TAG} asset count differs from the allowlist"
+              exit 1
+            fi
+          }
+
+          RELEASE_EXISTS=false
+          RELEASE_IS_DRAFT=false
+          RELEASE_ASSETS=()
+          READ_STATUS=0
+          read_release || READ_STATUS=$?
+          if [ "$READ_STATUS" -eq 0 ]; then
+            RELEASE_EXISTS=true
+          elif [ "$READ_STATUS" -ne 2 ]; then
+            exit "$READ_STATUS"
+          fi
+
+          if [ "$RELEASE_EXISTS" = true ] && [ "$RELEASE_IS_DRAFT" = false ]; then
+            require_exact_assets
+            EXISTING_ASSETS_DIR="$(mktemp -d)"
+            trap 'rm -rf "$EXISTING_ASSETS_DIR"' EXIT
+            gh release download "$TAG" --repo "$GH_REPO" --dir "$EXISTING_ASSETS_DIR"
+            "$RUNNER_TEMP/jayflow-release-tool" verify-bundle \
+              -version "$VERSION" \
+              -dir "$EXISTING_ASSETS_DIR" \
+              -portable-url "$PORTABLE_URL" \
+              -public-key "$PUBLIC_KEY"
+            for ASSET in "${EXPECTED_ASSETS[@]}"; do
+              if ! cmp -s "dist/${ASSET}" "$EXISTING_ASSETS_DIR/${ASSET}"; then
+                echo "::error::published release ${TAG} is immutable and asset ${ASSET} differs"
+                exit 1
+              fi
+            done
             gh release edit "$TAG" \
               --repo "$GH_REPO" \
               --title "JayFlow ${TAG}" \
@@ -348,21 +650,32 @@ jobs:
               --draft=false \
               --prerelease=false \
               --latest
+            exit 0
+          fi
+
+          if [ "$RELEASE_EXISTS" = true ]; then
+            reject_unexpected_assets
           else
             gh release create "$TAG" \
               --repo "$GH_REPO" \
               --title "JayFlow ${TAG}" \
               --notes-file "$NOTES_FILE" \
-              --prerelease=false \
-              --latest
+              --draft \
+              --prerelease=false
           fi
 
-          ASSETS=(
-            "dist/JayFlow-${VERSION}.exe"
-            "dist/JayFlow-${VERSION}-setup.exe"
-            "dist/JayFlow-setup.exe"
-            "dist/checksums.txt"
-            "dist/latest.json"
-            "dist/buildinfo.txt"
-          )
-          gh release upload "$TAG" "${ASSETS[@]}" --repo "$GH_REPO" --clobber
+          gh release upload "$TAG" "${NON_LATEST_ASSETS[@]}" --repo "$GH_REPO" --clobber
+          gh release upload "$TAG" dist/latest.json --repo "$GH_REPO" --clobber
+          read_release
+          if [ "$RELEASE_IS_DRAFT" != true ]; then
+            echo "::error::release became public before final reconciliation"
+            exit 1
+          fi
+          require_exact_assets
+          gh release edit "$TAG" \
+            --repo "$GH_REPO" \
+            --title "JayFlow ${TAG}" \
+            --notes-file "$NOTES_FILE" \
+            --draft=false \
+            --prerelease=false \
+            --latest
