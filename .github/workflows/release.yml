@@ -194,16 +194,18 @@ jobs:
           STRACE_URL: https://github.com/strace/strace/releases/download/v7.1/strace-7.1.tar.xz
           STRACE_SHA256: 81743ecf2a5b44186b2f5038afdc8beda7e5c70aed15b4fbfbcc6e9ece24490f
           STRACE_VERSION_LINE: strace -- version 7.1
-          GATE_TMPFS: /dev/shm
+          GATE_TMPFS: /tmp
+          GATE_TMPFS_OPTIONS: size=4g,mode=1777,nosuid,nodev
           GATE_TMPFS_MIN_BYTES: "2147483648"
-          GATE_ROOT: /dev/shm/jayflow-gate
-          GATE_TMPDIR: /dev/shm/jayflow-tmp
+          GATE_FOREIGN_TMPFS: /dev/shm
+          GATE_ROOT: /tmp/jayflow-gate
+          GATE_TMPDIR: /tmp
         run: |
           set -euo pipefail
 
           STRACE_PREFIX="$RUNNER_TEMP/strace-7.1"
           STRACE_BIN="$STRACE_PREFIX/bin/strace"
-          STRACE_SRC="$(mktemp -d)"
+          STRACE_SRC="$(mktemp -d -p "$RUNNER_TEMP")"
           trap 'rm -rf "$STRACE_SRC"' EXIT
 
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
@@ -231,28 +233,10 @@ jobs:
             exit 1
           fi
 
-          # The private gates were designed against a scratch on tmpfs and
-          # outside the real home. The runner satisfies neither by default:
-          # RUNNER_TEMP is /home/runner/work/_temp, which the gates refuse as
-          # part of the real home, and the ext4 behind it recycles an inode
-          # number the instant it is freed, so a listener or a path the gates
-          # had just probed comes back wearing the same identity. /dev/shm is
-          # the runner's tmpfs: it is outside /home and it draws inode numbers
-          # from a monotonic counter, which is exactly the reference machine.
-          GATE_FS_TYPE="$(stat -f -c %T "$GATE_TMPFS")"
-          if [ "$GATE_FS_TYPE" != tmpfs ]; then
-            echo "::error::${GATE_TMPFS} is ${GATE_FS_TYPE}, want tmpfs so the gates never observe a recycled inode number"
-            exit 1
-          fi
-          GATE_TMPFS_FREE="$(df --output=avail -B1 "$GATE_TMPFS" | tail -1 | tr -d ' ')"
-          if [ "$GATE_TMPFS_FREE" -lt "$GATE_TMPFS_MIN_BYTES" ]; then
-            echo "::error::${GATE_TMPFS} has ${GATE_TMPFS_FREE} free bytes, want at least ${GATE_TMPFS_MIN_BYTES} for the gate scratch"
-            exit 1
-          fi
-
           # The forbidden prefix is the account's registered home, which is what
           # the gates read from the account database, plus the two runner
-          # directories that live inside it.
+          # directories that live inside it. This is settled before anything is
+          # elevated, so a misconfigured target never reaches a mount.
           REAL_HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
           for reserved in "$REAL_HOME" "$RUNNER_TEMP" "${GITHUB_WORKSPACE:-}"; do
             [ -n "$reserved" ] || continue
@@ -266,10 +250,64 @@ jobs:
             done
           done
 
-          rm -rf "$GATE_ROOT" "$GATE_TMPDIR"
-          mkdir -m 700 -p "$GATE_ROOT" "$GATE_TMPDIR"
+          # The private gates were designed against one specific scratch, and the
+          # runner image reproduces none of it:
+          #   (A) they refuse a gate root or a validated scratch inside the
+          #       account's real home, and RUNNER_TEMP is /home/runner/work/_temp;
+          #   (B) the ext4 behind the runner's /tmp recycles an inode number the
+          #       instant it is freed, so a listener or a path the gates had just
+          #       probed comes back wearing the same identity, while tmpfs draws
+          #       inode numbers from a monotonic counter;
+          #   (C) the kernel caps a Unix socket path at 107 bytes. Behind the
+          #       20-byte scratch prefix this workflow used to carve out of
+          #       /dev/shm, the deepest gate socket measured 122 bytes and bind
+          #       refused it in 28 tests; the same socket is 106 bytes under
+          #       /tmp, which is why the reference machine never saw it;
+          #   (D) cmd/jayflowd/fsbroker_linux_test.go opens one fixture on
+          #       t.TempDir() and one on /dev/shm and fails when the two report
+          #       the same device.
+          # A fresh, bounded tmpfs mounted over /tmp answers all four at once and
+          # is exactly the reference machine's shape. Its size is capped because
+          # a tmpfs is charged against the runner's RAM, and it is nosuid,nodev
+          # because nothing the gates write there needs either.
+          sudo mount -t tmpfs -o "$GATE_TMPFS_OPTIONS" tmpfs "$GATE_TMPFS"
+
+          GATE_FS_TYPE="$(stat -f -c %T "$GATE_TMPFS")"
+          if [ "$GATE_FS_TYPE" != tmpfs ]; then
+            echo "::error::${GATE_TMPFS} is ${GATE_FS_TYPE}, want tmpfs so the gates never observe a recycled inode number"
+            exit 1
+          fi
+          GATE_DEVICE="$(stat -c %d "$GATE_TMPFS")"
+          GATE_FOREIGN_DEVICE="$(stat -c %d "$GATE_FOREIGN_TMPFS")"
+          if [ "$GATE_DEVICE" = "$GATE_FOREIGN_DEVICE" ]; then
+            echo "::error::${GATE_TMPFS} and ${GATE_FOREIGN_TMPFS} are both device ${GATE_DEVICE}, but the gates require two distinct filesystems"
+            exit 1
+          fi
+          GATE_TMPFS_FREE="$(df --output=avail -B1 "$GATE_TMPFS" | tail -1 | tr -d ' ')"
+          if [ "$GATE_TMPFS_FREE" -lt "$GATE_TMPFS_MIN_BYTES" ]; then
+            echo "::error::${GATE_TMPFS} has ${GATE_TMPFS_FREE} free bytes, want at least ${GATE_TMPFS_MIN_BYTES} for the gate scratch"
+            exit 1
+          fi
+
+          # The gates compile and run helper binaries out of their own TMPDIR, so
+          # a scratch that is mounted noexec, or that they cannot write, would
+          # fail them for a reason that reads as a product defect.
+          GATE_EXEC_PROBE="$GATE_TMPDIR/gate-exec-probe"
+          printf '#!/bin/sh\nexit 0\n' > "$GATE_EXEC_PROBE"
+          chmod 700 "$GATE_EXEC_PROBE"
+          if ! "$GATE_EXEC_PROBE"; then
+            echo "::error::${GATE_TMPDIR} refuses to execute what the gates build there"
+            exit 1
+          fi
+          rm -f "$GATE_EXEC_PROBE"
+
+          # The gates' TMPDIR is the mount point itself, which is what keeps the
+          # socket paths inside the kernel's budget, so only the gate root is
+          # provisioned here.
+          rm -rf "$GATE_ROOT"
+          mkdir -m 700 -p "$GATE_ROOT"
           mkdir -p "$GATE_ROOT/tasks"
-          chmod 700 "$GATE_ROOT" "$GATE_ROOT/tasks" "$GATE_TMPDIR"
+          chmod 700 "$GATE_ROOT" "$GATE_ROOT/tasks"
 
           if ! unshare -U true; then
             RESTRICTED="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
@@ -293,8 +331,8 @@ jobs:
       - name: Gate 2 - Go tests
         working-directory: source
         env:
-          JAYFLOW_LOCAL_GATE_ROOT: /dev/shm/jayflow-gate
-          TMPDIR: /dev/shm/jayflow-tmp
+          JAYFLOW_LOCAL_GATE_ROOT: /tmp/jayflow-gate
+          TMPDIR: /tmp
         run: |
           set -euo pipefail
           go test -count=1 ./...
@@ -302,8 +340,8 @@ jobs:
       - name: Gate 3 - Go race detector
         working-directory: source
         env:
-          JAYFLOW_LOCAL_GATE_ROOT: /dev/shm/jayflow-gate
-          TMPDIR: /dev/shm/jayflow-tmp
+          JAYFLOW_LOCAL_GATE_ROOT: /tmp/jayflow-gate
+          TMPDIR: /tmp
         run: |
           set -euo pipefail
           go test -race -count=1 ./...
@@ -591,13 +629,18 @@ jobs:
       - name: Release the private gate tmpfs
         if: always()
         env:
-          GATE_ROOT: /dev/shm/jayflow-gate
-          GATE_TMPDIR: /dev/shm/jayflow-tmp
+          GATE_TMPFS: /tmp
         run: |
           set -euo pipefail
-          # The gate scratch is RAM. Give it back even when a gate failed, so a
-          # re-run on the same host never starts against an occupied tmpfs.
-          rm -rf "$GATE_ROOT" "$GATE_TMPDIR"
+          # The gate scratch is a tmpfs mounted over the runner's own /tmp, and
+          # everything on it is charged against the runner's RAM. Give the mount
+          # back even when a gate failed, so the rest of the job and any re-run
+          # on the same host see the real /tmp again. The unmount is lazy because
+          # a gate that died may still hold descriptors on the scratch, and it is
+          # guarded because the preparation may have refused before mounting.
+          if mountpoint -q "$GATE_TMPFS"; then
+            sudo umount -l "$GATE_TMPFS"
+          fi
 
   build_linux:
     name: Validate and build Linux without the signing key
@@ -711,16 +754,18 @@ jobs:
           STRACE_URL: https://github.com/strace/strace/releases/download/v7.1/strace-7.1.tar.xz
           STRACE_SHA256: 81743ecf2a5b44186b2f5038afdc8beda7e5c70aed15b4fbfbcc6e9ece24490f
           STRACE_VERSION_LINE: strace -- version 7.1
-          GATE_TMPFS: /dev/shm
+          GATE_TMPFS: /tmp
+          GATE_TMPFS_OPTIONS: size=4g,mode=1777,nosuid,nodev
           GATE_TMPFS_MIN_BYTES: "2147483648"
-          GATE_ROOT: /dev/shm/jayflow-gate
-          GATE_TMPDIR: /dev/shm/jayflow-tmp
+          GATE_FOREIGN_TMPFS: /dev/shm
+          GATE_ROOT: /tmp/jayflow-gate
+          GATE_TMPDIR: /tmp
         run: |
           set -euo pipefail
 
           STRACE_PREFIX="$RUNNER_TEMP/strace-7.1"
           STRACE_BIN="$STRACE_PREFIX/bin/strace"
-          STRACE_SRC="$(mktemp -d)"
+          STRACE_SRC="$(mktemp -d -p "$RUNNER_TEMP")"
           trap 'rm -rf "$STRACE_SRC"' EXIT
 
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
@@ -748,28 +793,10 @@ jobs:
             exit 1
           fi
 
-          # The private gates were designed against a scratch on tmpfs and
-          # outside the real home. The runner satisfies neither by default:
-          # RUNNER_TEMP is /home/runner/work/_temp, which the gates refuse as
-          # part of the real home, and the ext4 behind it recycles an inode
-          # number the instant it is freed, so a listener or a path the gates
-          # had just probed comes back wearing the same identity. /dev/shm is
-          # the runner's tmpfs: it is outside /home and it draws inode numbers
-          # from a monotonic counter, which is exactly the reference machine.
-          GATE_FS_TYPE="$(stat -f -c %T "$GATE_TMPFS")"
-          if [ "$GATE_FS_TYPE" != tmpfs ]; then
-            echo "::error::${GATE_TMPFS} is ${GATE_FS_TYPE}, want tmpfs so the gates never observe a recycled inode number"
-            exit 1
-          fi
-          GATE_TMPFS_FREE="$(df --output=avail -B1 "$GATE_TMPFS" | tail -1 | tr -d ' ')"
-          if [ "$GATE_TMPFS_FREE" -lt "$GATE_TMPFS_MIN_BYTES" ]; then
-            echo "::error::${GATE_TMPFS} has ${GATE_TMPFS_FREE} free bytes, want at least ${GATE_TMPFS_MIN_BYTES} for the gate scratch"
-            exit 1
-          fi
-
           # The forbidden prefix is the account's registered home, which is what
           # the gates read from the account database, plus the two runner
-          # directories that live inside it.
+          # directories that live inside it. This is settled before anything is
+          # elevated, so a misconfigured target never reaches a mount.
           REAL_HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
           for reserved in "$REAL_HOME" "$RUNNER_TEMP" "${GITHUB_WORKSPACE:-}"; do
             [ -n "$reserved" ] || continue
@@ -783,10 +810,64 @@ jobs:
             done
           done
 
-          rm -rf "$GATE_ROOT" "$GATE_TMPDIR"
-          mkdir -m 700 -p "$GATE_ROOT" "$GATE_TMPDIR"
+          # The private gates were designed against one specific scratch, and the
+          # runner image reproduces none of it:
+          #   (A) they refuse a gate root or a validated scratch inside the
+          #       account's real home, and RUNNER_TEMP is /home/runner/work/_temp;
+          #   (B) the ext4 behind the runner's /tmp recycles an inode number the
+          #       instant it is freed, so a listener or a path the gates had just
+          #       probed comes back wearing the same identity, while tmpfs draws
+          #       inode numbers from a monotonic counter;
+          #   (C) the kernel caps a Unix socket path at 107 bytes. Behind the
+          #       20-byte scratch prefix this workflow used to carve out of
+          #       /dev/shm, the deepest gate socket measured 122 bytes and bind
+          #       refused it in 28 tests; the same socket is 106 bytes under
+          #       /tmp, which is why the reference machine never saw it;
+          #   (D) cmd/jayflowd/fsbroker_linux_test.go opens one fixture on
+          #       t.TempDir() and one on /dev/shm and fails when the two report
+          #       the same device.
+          # A fresh, bounded tmpfs mounted over /tmp answers all four at once and
+          # is exactly the reference machine's shape. Its size is capped because
+          # a tmpfs is charged against the runner's RAM, and it is nosuid,nodev
+          # because nothing the gates write there needs either.
+          sudo mount -t tmpfs -o "$GATE_TMPFS_OPTIONS" tmpfs "$GATE_TMPFS"
+
+          GATE_FS_TYPE="$(stat -f -c %T "$GATE_TMPFS")"
+          if [ "$GATE_FS_TYPE" != tmpfs ]; then
+            echo "::error::${GATE_TMPFS} is ${GATE_FS_TYPE}, want tmpfs so the gates never observe a recycled inode number"
+            exit 1
+          fi
+          GATE_DEVICE="$(stat -c %d "$GATE_TMPFS")"
+          GATE_FOREIGN_DEVICE="$(stat -c %d "$GATE_FOREIGN_TMPFS")"
+          if [ "$GATE_DEVICE" = "$GATE_FOREIGN_DEVICE" ]; then
+            echo "::error::${GATE_TMPFS} and ${GATE_FOREIGN_TMPFS} are both device ${GATE_DEVICE}, but the gates require two distinct filesystems"
+            exit 1
+          fi
+          GATE_TMPFS_FREE="$(df --output=avail -B1 "$GATE_TMPFS" | tail -1 | tr -d ' ')"
+          if [ "$GATE_TMPFS_FREE" -lt "$GATE_TMPFS_MIN_BYTES" ]; then
+            echo "::error::${GATE_TMPFS} has ${GATE_TMPFS_FREE} free bytes, want at least ${GATE_TMPFS_MIN_BYTES} for the gate scratch"
+            exit 1
+          fi
+
+          # The gates compile and run helper binaries out of their own TMPDIR, so
+          # a scratch that is mounted noexec, or that they cannot write, would
+          # fail them for a reason that reads as a product defect.
+          GATE_EXEC_PROBE="$GATE_TMPDIR/gate-exec-probe"
+          printf '#!/bin/sh\nexit 0\n' > "$GATE_EXEC_PROBE"
+          chmod 700 "$GATE_EXEC_PROBE"
+          if ! "$GATE_EXEC_PROBE"; then
+            echo "::error::${GATE_TMPDIR} refuses to execute what the gates build there"
+            exit 1
+          fi
+          rm -f "$GATE_EXEC_PROBE"
+
+          # The gates' TMPDIR is the mount point itself, which is what keeps the
+          # socket paths inside the kernel's budget, so only the gate root is
+          # provisioned here.
+          rm -rf "$GATE_ROOT"
+          mkdir -m 700 -p "$GATE_ROOT"
           mkdir -p "$GATE_ROOT/tasks"
-          chmod 700 "$GATE_ROOT" "$GATE_ROOT/tasks" "$GATE_TMPDIR"
+          chmod 700 "$GATE_ROOT" "$GATE_ROOT/tasks"
 
           if ! unshare -U true; then
             RESTRICTED="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
@@ -804,8 +885,8 @@ jobs:
       - name: Run focused Linux release gates
         working-directory: source
         env:
-          JAYFLOW_LOCAL_GATE_ROOT: /dev/shm/jayflow-gate
-          TMPDIR: /dev/shm/jayflow-tmp
+          JAYFLOW_LOCAL_GATE_ROOT: /tmp/jayflow-gate
+          TMPDIR: /tmp
         run: |
           set -euo pipefail
           go test -race ./internal/updater ./internal/webservice ./internal/gateway ./internal/webserver ./cmd/jayflow-web -count=1
@@ -888,13 +969,18 @@ jobs:
       - name: Release the private gate tmpfs
         if: always()
         env:
-          GATE_ROOT: /dev/shm/jayflow-gate
-          GATE_TMPDIR: /dev/shm/jayflow-tmp
+          GATE_TMPFS: /tmp
         run: |
           set -euo pipefail
-          # The gate scratch is RAM. Give it back even when a gate failed, so a
-          # re-run on the same host never starts against an occupied tmpfs.
-          rm -rf "$GATE_ROOT" "$GATE_TMPDIR"
+          # The gate scratch is a tmpfs mounted over the runner's own /tmp, and
+          # everything on it is charged against the runner's RAM. Give the mount
+          # back even when a gate failed, so the rest of the job and any re-run
+          # on the same host see the real /tmp again. The unmount is lazy because
+          # a gate that died may still hold descriptors on the scratch, and it is
+          # guarded because the preparation may have refused before mounting.
+          if mountpoint -q "$GATE_TMPFS"; then
+            sudo umount -l "$GATE_TMPFS"
+          fi
 
   accept_linux:
     name: Accept transported Linux bytes under real systemd and Playwright
