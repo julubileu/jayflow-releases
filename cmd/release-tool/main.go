@@ -29,14 +29,16 @@ import (
 )
 
 const (
-	privateKeyEnv        = "JAYFLOW_RELEASE_PRIVATE_KEY"
-	updateSigningDomain  = "jayflow-update-v1"
-	releaseSigningDomain = "jayflow-release-manifest-v1"
-	releaseSchema        = "jayflow-release-v1"
-	latestName           = "latest.json"
-	releaseManifestName  = "release-manifest.json"
-	releaseSignatureName = "release-manifest.sig"
-	checksumsName        = "checksums.txt"
+	privateKeyEnv              = "JAYFLOW_RELEASE_PRIVATE_KEY"
+	windowsUpdateSigningDomain = "jayflow-update-v1"
+	linuxUpdateSigningDomain   = "jayflow-linux-update-v1"
+	releaseSigningDomain       = "jayflow-release-manifest-v1"
+	releaseSchema              = "jayflow-release-v1"
+	windowsLatestName          = "latest.json"
+	linuxLatestName            = "linux-latest.json"
+	releaseManifestName        = "release-manifest.json"
+	releaseSignatureName       = "release-manifest.sig"
+	checksumsName              = "checksums.txt"
 )
 
 var (
@@ -72,7 +74,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("command required: pubkey, sign-bundle, verify-bundle, audit-daemon, or audit-windows")
+		return errors.New("command required: pubkey, sign-bundle, verify-bundle, audit-daemon, audit-windows, or audit-linux")
 	}
 	switch args[0] {
 	case "pubkey":
@@ -91,29 +93,31 @@ func run(args []string) error {
 		version := flags.String("version", "", "release version")
 		dir := flags.String("dir", "", "artifact directory")
 		url := flags.String("portable-url", "", "portable artifact URL")
+		linuxURL := flags.String("linux-url", "", "Linux artifact URL")
 		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
-			return errors.New("usage: sign-bundle -version X.Y.Z[-dev] -dir DIR -portable-url HTTPS_URL")
+			return errors.New("usage: sign-bundle -version X.Y.Z[-dev] -dir DIR -portable-url HTTPS_URL -linux-url HTTPS_URL")
 		}
 		private, err := privateKeyFromEnv()
 		if err != nil {
 			return err
 		}
-		return signBundle(*dir, *version, *url, private)
+		return signBundle(*dir, *version, *url, *linuxURL, private)
 	case "verify-bundle":
 		flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 		flags.SetOutput(io.Discard)
 		version := flags.String("version", "", "release version")
 		dir := flags.String("dir", "", "artifact directory")
 		url := flags.String("portable-url", "", "portable artifact URL")
+		linuxURL := flags.String("linux-url", "", "Linux artifact URL")
 		publicText := flags.String("public-key", "", "base64 Ed25519 public key")
 		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
-			return errors.New("usage: verify-bundle -version X.Y.Z[-dev] -dir DIR -portable-url HTTPS_URL -public-key BASE64")
+			return errors.New("usage: verify-bundle -version X.Y.Z[-dev] -dir DIR -portable-url HTTPS_URL -linux-url HTTPS_URL -public-key BASE64")
 		}
 		public, err := decodePublicKey(*publicText)
 		if err != nil {
 			return err
 		}
-		return verifyBundle(*dir, *version, *url, public)
+		return verifyBundle(*dir, *version, *url, *linuxURL, public)
 	case "audit-daemon":
 		flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 		flags.SetOutput(io.Discard)
@@ -139,12 +143,23 @@ func run(args []string) error {
 			return err
 		}
 		return auditWindows(*dir, *daemon, *version, *sourceRef, *sourceSHA, *publicText)
+	case "audit-linux":
+		flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		version := flags.String("version", "", "release version")
+		path := flags.String("path", "", "jayflow-web path")
+		sourceSHA := flags.String("source-sha", "", "exact source commit")
+		publicText := flags.String("public-key", "", "base64 Ed25519 public key")
+		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
+			return errors.New("usage: audit-linux -version X.Y.Z[-dev] -path FILE -source-sha SHA -public-key BASE64")
+		}
+		return auditLinux(*path, *version, *sourceSHA, *publicText)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
 
-func signBundle(dir, version, portableURL string, private ed25519.PrivateKey) error {
+func signBundle(dir, version, portableURL, linuxURL string, private ed25519.PrivateKey) error {
 	if len(private) != ed25519.PrivateKeySize {
 		return fmt.Errorf("private key is %d bytes, want %d", len(private), ed25519.PrivateKeySize)
 	}
@@ -154,7 +169,10 @@ func signBundle(dir, version, portableURL string, private ed25519.PrivateKey) er
 	if err := validatePortableURL(portableURL, version); err != nil {
 		return err
 	}
-	if err := requireExactInventory(dir, unsignedAssetNames(version)); err != nil {
+	if err := validateLinuxURL(linuxURL, version); err != nil {
+		return err
+	}
+	if err := requireExactInventory(dir, bundleUnsignedAssetNames(version)); err != nil {
 		return fmt.Errorf("unsigned bundle: %w", err)
 	}
 	if err := requireIdenticalInstallers(dir, version); err != nil {
@@ -166,19 +184,30 @@ func signBundle(dir, version, portableURL string, private ed25519.PrivateKey) er
 	if err != nil {
 		return err
 	}
-	latest := latestManifest{
+	windowsLatest := latestManifest{
 		Version: version,
 		URL:     portableURL,
 		SHA256:  portableDigest,
 	}
-	latest.Sig = base64.StdEncoding.EncodeToString(signDetached(private,
-		signingPayload(latest.Version, latest.SHA256)))
-	if err := writeJSON(filepath.Join(dir, latestName), latest); err != nil {
+	windowsLatest.Sig = base64.StdEncoding.EncodeToString(signDetached(private,
+		channelPayload(windowsUpdateSigningDomain, windowsLatest.Version, windowsLatest.SHA256)))
+	if err := writeJSON(filepath.Join(dir, windowsLatestName), windowsLatest); err != nil {
+		return err
+	}
+
+	linuxDigest, _, err := hashFile(filepath.Join(dir, linuxArtifactName(version)))
+	if err != nil {
+		return err
+	}
+	linuxLatest := latestManifest{Version: version, URL: linuxURL, SHA256: linuxDigest}
+	linuxLatest.Sig = base64.StdEncoding.EncodeToString(signDetached(private,
+		channelPayload(linuxUpdateSigningDomain, linuxLatest.Version, linuxLatest.SHA256)))
+	if err := writeJSON(filepath.Join(dir, linuxLatestName), linuxLatest); err != nil {
 		return err
 	}
 
 	release := releaseManifest{Schema: releaseSchema, Version: version}
-	for _, name := range unsignedAssetNames(version) {
+	for _, name := range bundleUnsignedAssetNames(version) {
 		digest, size, err := hashFile(filepath.Join(dir, name))
 		if err != nil {
 			return err
@@ -204,17 +233,20 @@ func signBundle(dir, version, portableURL string, private ed25519.PrivateKey) er
 		return err
 	}
 	public := private.Public().(ed25519.PublicKey)
-	if err := verifyBundle(dir, version, portableURL, public); err != nil {
+	if err := verifyBundle(dir, version, portableURL, linuxURL, public); err != nil {
 		return fmt.Errorf("self-check: %w", err)
 	}
 	return nil
 }
 
-func verifyBundle(dir, version, portableURL string, public ed25519.PublicKey) error {
+func verifyBundle(dir, version, portableURL, linuxURL string, public ed25519.PublicKey) error {
 	if _, err := validateVersion(version); err != nil {
 		return err
 	}
 	if err := validatePortableURL(portableURL, version); err != nil {
+		return err
+	}
+	if err := validateLinuxURL(linuxURL, version); err != nil {
 		return err
 	}
 	if len(public) != ed25519.PublicKeySize {
@@ -238,7 +270,7 @@ func verifyBundle(dir, version, portableURL string, public ed25519.PublicKey) er
 	if release.Schema != releaseSchema || release.Version != version {
 		return fmt.Errorf("%s has wrong schema or version", releaseManifestName)
 	}
-	expectedNames := unsignedAssetNames(version)
+	expectedNames := bundleUnsignedAssetNames(version)
 	if len(release.Assets) != len(expectedNames) {
 		return fmt.Errorf("%s has %d assets, want %d", releaseManifestName, len(release.Assets), len(expectedNames))
 	}
@@ -267,30 +299,56 @@ func verifyBundle(dir, version, portableURL string, public ed25519.PublicKey) er
 		return fmt.Errorf("%s signature is invalid", releaseManifestName)
 	}
 
-	latestBody, err := readRegularFile(filepath.Join(dir, latestName))
+	windowsLatestBody, err := readRegularFile(filepath.Join(dir, windowsLatestName))
 	if err != nil {
 		return err
 	}
-	var latest latestManifest
-	if err := decodeStrictJSON(latestBody, &latest); err != nil {
-		return fmt.Errorf("%s: %w", latestName, err)
+	var windowsLatest latestManifest
+	if err := decodeStrictJSON(windowsLatestBody, &windowsLatest); err != nil {
+		return fmt.Errorf("%s: %w", windowsLatestName, err)
 	}
-	if latest.Version != version || latest.URL != portableURL || !validDigest(latest.SHA256) {
-		return fmt.Errorf("%s has invalid version, URL, or digest", latestName)
+	if windowsLatest.Version != version || windowsLatest.URL != portableURL || !validDigest(windowsLatest.SHA256) {
+		return fmt.Errorf("%s has invalid version, URL, or digest", windowsLatestName)
 	}
-	latestSignature, err := base64.StdEncoding.DecodeString(strings.TrimSpace(latest.Sig))
-	if err != nil || len(latestSignature) != ed25519.SignatureSize {
-		return fmt.Errorf("%s has invalid signature encoding", latestName)
+	windowsSignature, err := base64.StdEncoding.DecodeString(strings.TrimSpace(windowsLatest.Sig))
+	if err != nil || len(windowsSignature) != ed25519.SignatureSize {
+		return fmt.Errorf("%s has invalid signature encoding", windowsLatestName)
 	}
-	if !ed25519.Verify(public, signingPayload(latest.Version, latest.SHA256), latestSignature) {
-		return fmt.Errorf("%s signature is invalid", latestName)
+	if !ed25519.Verify(public, channelPayload(windowsUpdateSigningDomain, windowsLatest.Version, windowsLatest.SHA256), windowsSignature) {
+		return fmt.Errorf("%s signature is invalid", windowsLatestName)
 	}
 	portableDigest, _, err := hashFile(filepath.Join(dir, "JayFlow-"+version+".exe"))
 	if err != nil {
 		return err
 	}
-	if subtle.ConstantTimeCompare([]byte(portableDigest), []byte(latest.SHA256)) != 1 {
-		return fmt.Errorf("%s does not match portable bytes", latestName)
+	if subtle.ConstantTimeCompare([]byte(portableDigest), []byte(windowsLatest.SHA256)) != 1 {
+		return fmt.Errorf("%s does not match portable bytes", windowsLatestName)
+	}
+
+	linuxLatestBody, err := readRegularFile(filepath.Join(dir, linuxLatestName))
+	if err != nil {
+		return err
+	}
+	var linuxLatest latestManifest
+	if err := decodeStrictJSON(linuxLatestBody, &linuxLatest); err != nil {
+		return fmt.Errorf("%s: %w", linuxLatestName, err)
+	}
+	if linuxLatest.Version != version || linuxLatest.URL != linuxURL || !validDigest(linuxLatest.SHA256) {
+		return fmt.Errorf("%s has invalid version, URL, or digest", linuxLatestName)
+	}
+	linuxSignature, err := base64.StdEncoding.DecodeString(strings.TrimSpace(linuxLatest.Sig))
+	if err != nil || len(linuxSignature) != ed25519.SignatureSize {
+		return fmt.Errorf("%s has invalid signature encoding", linuxLatestName)
+	}
+	if !ed25519.Verify(public, channelPayload(linuxUpdateSigningDomain, linuxLatest.Version, linuxLatest.SHA256), linuxSignature) {
+		return fmt.Errorf("%s signature is invalid", linuxLatestName)
+	}
+	linuxDigest, _, err := hashFile(filepath.Join(dir, linuxArtifactName(version)))
+	if err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare([]byte(linuxDigest), []byte(linuxLatest.SHA256)) != 1 {
+		return fmt.Errorf("%s does not match Linux artifact bytes", linuxLatestName)
 	}
 
 	wantChecksums, err := generateChecksums(dir, version)
@@ -361,6 +419,76 @@ func inspectDaemon(path, version string) ([]byte, error) {
 	return body, nil
 }
 
+func auditLinux(path, version, sourceSHA, publicKey string) error {
+	if _, err := validateVersion(version); err != nil {
+		return err
+	}
+	if !strictSourceSHAPattern.MatchString(sourceSHA) {
+		return errors.New("source SHA must be a lowercase 40-character commit SHA")
+	}
+	public, err := decodePublicKey(publicKey)
+	if err != nil {
+		return err
+	}
+	if publicKey != base64.StdEncoding.EncodeToString(public) {
+		return errors.New("public key must use canonical base64 encoding")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("%s is not executable", path)
+	}
+	body, err := readRegularFile(path)
+	if err != nil {
+		return err
+	}
+	file, err := elf.NewFile(bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("Linux artifact is not ELF: %w", err)
+	}
+	defer file.Close()
+	if file.Class != elf.ELFCLASS64 || file.Data != elf.ELFDATA2LSB || file.Machine != elf.EM_X86_64 {
+		return fmt.Errorf("Linux artifact is %s/%s/%s, want ELF64/LSB/amd64", file.Class, file.Data, file.Machine)
+	}
+	build, err := buildinfo.Read(bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("Linux artifact has no Go build info: %w", err)
+	}
+	if build.Path != "github.com/julubileu/jayflow-v2/cmd/jayflow-web" {
+		return fmt.Errorf("Go main path is %q, want github.com/julubileu/jayflow-v2/cmd/jayflow-web", build.Path)
+	}
+	settings := make(map[string]string, len(build.Settings))
+	for _, setting := range build.Settings {
+		settings[setting.Key] = setting.Value
+	}
+	required := map[string]string{
+		"GOOS":         "linux",
+		"GOARCH":       "amd64",
+		"CGO_ENABLED":  "0",
+		"-trimpath":    "true",
+		"vcs.revision": sourceSHA,
+		"vcs.modified": "false",
+	}
+	for key, want := range required {
+		if settings[key] != want {
+			return fmt.Errorf("Go build setting %s is %q, want %q", key, settings[key], want)
+		}
+	}
+	for name, marker := range map[string]string{
+		"Version": version, "SourceSHA": sourceSHA, "PublicKey": publicKey,
+	} {
+		if !bytes.Contains(body, []byte(marker)) {
+			return fmt.Errorf("Linux artifact does not contain stamped %s", name)
+		}
+	}
+	return nil
+}
+
 func auditWindows(dir, daemonPath, version, sourceRef, sourceSHA, publicKey string) error {
 	parts, err := validateVersion(version)
 	if err != nil {
@@ -373,7 +501,7 @@ func auditWindows(dir, daemonPath, version, sourceRef, sourceSHA, publicKey stri
 	if err != nil {
 		return fmt.Errorf("embedded daemon: %w", err)
 	}
-	if err := requireExactInventory(dir, unsignedAssetNames(version)); err != nil {
+	if err := requireExactInventory(dir, windowsUnsignedAssetNames(version)); err != nil {
 		return err
 	}
 	if err := requireIdenticalInstallers(dir, version); err != nil {
@@ -726,9 +854,27 @@ func validatePortableURL(url, version string) error {
 	return nil
 }
 
-func signingPayload(version, digest string) []byte {
+func validateLinuxURL(url, version string) error {
+	if url == "" || !strings.HasPrefix(url, "https://") {
+		return errors.New("Linux URL must use https")
+	}
+	if !strings.HasSuffix(url, "/"+linuxArtifactName(version)) {
+		return errors.New("Linux URL does not name the versioned Linux artifact")
+	}
+	return nil
+}
+
+func linuxArtifactName(version string) string {
+	return "jayflow-web-" + version + "-linux-amd64"
+}
+
+func channelPayload(domain, version, digest string) []byte {
 	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
-	return []byte(updateSigningDomain + "\n" + version + "\n" + strings.ToLower(strings.TrimSpace(digest)) + "\n")
+	return []byte(domain + "\n" + version + "\n" + strings.ToLower(strings.TrimSpace(digest)) + "\n")
+}
+
+func signingPayload(version, digest string) []byte {
+	return channelPayload(windowsUpdateSigningDomain, version, digest)
 }
 
 func releaseSigningPayload(manifest []byte) []byte {
@@ -758,7 +904,7 @@ func decodePublicKey(encoded string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(raw), nil
 }
 
-func unsignedAssetNames(version string) []string {
+func windowsUnsignedAssetNames(version string) []string {
 	return []string{
 		"JayFlow-" + version + ".exe",
 		"JayFlow-" + version + "-setup.exe",
@@ -767,14 +913,18 @@ func unsignedAssetNames(version string) []string {
 	}
 }
 
+func bundleUnsignedAssetNames(version string) []string {
+	return append(append([]string{}, windowsUnsignedAssetNames(version)...), linuxArtifactName(version))
+}
+
 func signedAssetNames(version string) []string {
-	names := append([]string{}, unsignedAssetNames(version)...)
-	return append(names, latestName, releaseManifestName, releaseSignatureName, checksumsName)
+	return append(append([]string{}, bundleUnsignedAssetNames(version)...),
+		windowsLatestName, linuxLatestName, releaseManifestName, releaseSignatureName, checksumsName)
 }
 
 func checksumCoveredNames(version string) []string {
-	names := append([]string{}, unsignedAssetNames(version)...)
-	return append(names, latestName, releaseManifestName, releaseSignatureName)
+	return append(append([]string{}, bundleUnsignedAssetNames(version)...),
+		windowsLatestName, linuxLatestName, releaseManifestName, releaseSignatureName)
 }
 
 func requireExactInventory(dir string, expected []string) error {

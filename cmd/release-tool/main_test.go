@@ -3,16 +3,20 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"debug/elf"
 	"debug/pe"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -42,19 +46,20 @@ func TestEd25519RFC8032VectorOne(t *testing.T) {
 func TestSignAndVerifyBundleAuthenticatesEveryDistributedArtifact(t *testing.T) {
 	dir := t.TempDir()
 	version := "2.0.33-dev"
-	writeUnsignedFixture(t, dir, version)
+	writeUnsignedBundleFixture(t, dir, version)
 	private := vectorPrivateKey(t)
-	url := "https://github.com/julubileu/jayflow-releases/releases/download/v2.0.33-dev/JayFlow-2.0.33-dev.exe"
+	windowsURL := "https://github.com/julubileu/jayflow-releases/releases/download/v2.0.33-dev/JayFlow-2.0.33-dev.exe"
+	linuxURL := "https://github.com/julubileu/jayflow-releases/releases/download/v2.0.33-dev/jayflow-web-2.0.33-dev-linux-amd64"
 
-	if err := signBundle(dir, version, url, private); err != nil {
+	if err := signBundle(dir, version, windowsURL, linuxURL, private); err != nil {
 		t.Fatalf("signBundle() error = %v", err)
 	}
 	public := private.Public().(ed25519.PublicKey)
-	if err := verifyBundle(dir, version, url, public); err != nil {
+	if err := verifyBundle(dir, version, windowsURL, linuxURL, public); err != nil {
 		t.Fatalf("verifyBundle() error = %v", err)
 	}
 
-	for _, name := range unsignedAssetNames(version) {
+	for _, name := range bundleUnsignedAssetNames(version) {
 		t.Run("tampered_"+name, func(t *testing.T) {
 			copyDir := t.TempDir()
 			copyFiles(t, dir, copyDir)
@@ -69,7 +74,7 @@ func TestSignAndVerifyBundleAuthenticatesEveryDistributedArtifact(t *testing.T) 
 			if err := handle.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if err := verifyBundle(copyDir, version, url, public); err == nil {
+			if err := verifyBundle(copyDir, version, windowsURL, linuxURL, public); err == nil {
 				t.Fatal("verifyBundle() accepted a tampered distributed artifact")
 			}
 		})
@@ -79,12 +84,13 @@ func TestSignAndVerifyBundleAuthenticatesEveryDistributedArtifact(t *testing.T) 
 func TestVerifyBundleRejectsMissingAndExtraFiles(t *testing.T) {
 	version := "2.0.33-dev"
 	private := vectorPrivateKey(t)
-	url := "https://example.invalid/JayFlow-2.0.33-dev.exe"
+	windowsURL := "https://example.invalid/JayFlow-2.0.33-dev.exe"
+	linuxURL := "https://example.invalid/jayflow-web-2.0.33-dev-linux-amd64"
 	makeBundle := func(t *testing.T) string {
 		t.Helper()
 		dir := t.TempDir()
-		writeUnsignedFixture(t, dir, version)
-		if err := signBundle(dir, version, url, private); err != nil {
+		writeUnsignedBundleFixture(t, dir, version)
+		if err := signBundle(dir, version, windowsURL, linuxURL, private); err != nil {
 			t.Fatal(err)
 		}
 		return dir
@@ -92,10 +98,10 @@ func TestVerifyBundleRejectsMissingAndExtraFiles(t *testing.T) {
 
 	t.Run("missing", func(t *testing.T) {
 		dir := makeBundle(t)
-		if err := os.Remove(filepath.Join(dir, "buildinfo.txt")); err != nil {
+		if err := os.Remove(filepath.Join(dir, linuxArtifactName(version))); err != nil {
 			t.Fatal(err)
 		}
-		if err := verifyBundle(dir, version, url, private.Public().(ed25519.PublicKey)); err == nil {
+		if err := verifyBundle(dir, version, windowsURL, linuxURL, private.Public().(ed25519.PublicKey)); err == nil {
 			t.Fatal("verifyBundle() accepted a missing asset")
 		}
 	})
@@ -104,7 +110,7 @@ func TestVerifyBundleRejectsMissingAndExtraFiles(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "unexpected.exe"), []byte("extra"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := verifyBundle(dir, version, url, private.Public().(ed25519.PublicKey)); err == nil {
+		if err := verifyBundle(dir, version, windowsURL, linuxURL, private.Public().(ed25519.PublicKey)); err == nil {
 			t.Fatal("verifyBundle() accepted an extra asset")
 		}
 	})
@@ -127,7 +133,7 @@ func TestReleaseToolRejectsSymlinkAndNonRegularInputs(t *testing.T) {
 		if err := os.Symlink(outside, asset); err != nil {
 			t.Fatal(err)
 		}
-		if err := requireExactInventory(dir, unsignedAssetNames(version)); err == nil {
+		if err := requireExactInventory(dir, windowsUnsignedAssetNames(version)); err == nil {
 			t.Fatal("requireExactInventory() accepted a symlink asset")
 		}
 		if _, _, err := hashFile(asset); err == nil {
@@ -145,7 +151,7 @@ func TestReleaseToolRejectsSymlinkAndNonRegularInputs(t *testing.T) {
 		if err := syscall.Mkfifo(asset, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := requireExactInventory(dir, unsignedAssetNames(version)); err == nil {
+		if err := requireExactInventory(dir, windowsUnsignedAssetNames(version)); err == nil {
 			t.Fatal("requireExactInventory() accepted a FIFO asset")
 		}
 	})
@@ -157,7 +163,7 @@ func TestReleaseToolRejectsSymlinkAndNonRegularInputs(t *testing.T) {
 		if err := os.Symlink(realDir, link); err != nil {
 			t.Fatal(err)
 		}
-		if err := requireExactInventory(link, unsignedAssetNames(version)); err == nil {
+		if err := requireExactInventory(link, windowsUnsignedAssetNames(version)); err == nil {
 			t.Fatal("requireExactInventory() followed a symlink directory")
 		}
 	})
@@ -169,7 +175,7 @@ func TestReleaseToolNeverFollowsSymlinkOutputs(t *testing.T) {
 	if err := os.WriteFile(outside, []byte("unchanged"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	output := filepath.Join(dir, latestName)
+	output := filepath.Join(dir, windowsLatestName)
 	if err := os.Symlink(outside, output); err != nil {
 		t.Fatal(err)
 	}
@@ -188,10 +194,11 @@ func TestReleaseToolNeverFollowsSymlinkOutputs(t *testing.T) {
 func TestChecksumsCoverEveryAssetExceptTheChecksumFileItself(t *testing.T) {
 	dir := t.TempDir()
 	version := "2.0.33-dev"
-	writeUnsignedFixture(t, dir, version)
+	writeUnsignedBundleFixture(t, dir, version)
 	private := vectorPrivateKey(t)
-	url := "https://example.invalid/JayFlow-2.0.33-dev.exe"
-	if err := signBundle(dir, version, url, private); err != nil {
+	windowsURL := "https://example.invalid/JayFlow-2.0.33-dev.exe"
+	linuxURL := "https://example.invalid/jayflow-web-2.0.33-dev-linux-amd64"
+	if err := signBundle(dir, version, windowsURL, linuxURL, private); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(filepath.Join(dir, checksumsName))
@@ -199,13 +206,357 @@ func TestChecksumsCoverEveryAssetExceptTheChecksumFileItself(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(body)
-	for _, name := range checksumCoveredNames(version) {
+	wantNames := []string{
+		"JayFlow-" + version + ".exe",
+		"JayFlow-" + version + "-setup.exe",
+		"JayFlow-setup.exe",
+		"buildinfo.txt",
+		"jayflow-web-" + version + "-linux-amd64",
+		"latest.json",
+		"linux-latest.json",
+		"release-manifest.json",
+		"release-manifest.sig",
+	}
+	lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
+	if len(lines) != len(wantNames) {
+		t.Fatalf("checksums.txt has %d lines, want %d", len(lines), len(wantNames))
+	}
+	for index, name := range wantNames {
 		if !strings.Contains(text, "  "+name+"\n") {
 			t.Errorf("checksums.txt does not cover %s", name)
+		}
+		digest, gotName, ok := strings.Cut(lines[index], "  ")
+		if !ok || !validDigest(digest) || gotName != name {
+			t.Errorf("checksums.txt line %d = %q, want digest and %q", index+1, lines[index], name)
 		}
 	}
 	if strings.Contains(text, "  "+checksumsName+"\n") {
 		t.Fatal("checksums.txt contains an impossible self-hash")
+	}
+}
+
+func TestSignedBundlePreservesWindowsAndAddsLinux(t *testing.T) {
+	dir, version := t.TempDir(), "2.0.35-dev"
+	writeUnsignedBundleFixture(t, dir, version)
+	private := vectorPrivateKey(t)
+	public := private.Public().(ed25519.PublicKey)
+	windowsURL := "https://example.invalid/JayFlow-" + version + ".exe"
+	linuxURL := "https://example.invalid/jayflow-web-" + version + "-linux-amd64"
+	digest, _, err := hashFile(filepath.Join(dir, "JayFlow-"+version+".exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	windowsExpected := latestManifest{Version: version, URL: windowsURL, SHA256: digest}
+	windowsExpected.Sig = base64.StdEncoding.EncodeToString(signDetached(private,
+		channelPayload(windowsUpdateSigningDomain, version, digest)))
+	windowsBefore, err := marshalJSON(windowsExpected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := signBundle(dir, version, windowsURL, linuxURL, private); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"JayFlow-2.0.35-dev.exe", "JayFlow-2.0.35-dev-setup.exe", "JayFlow-setup.exe", "buildinfo.txt",
+		"release-manifest.json", "release-manifest.sig", "checksums.txt", "latest.json",
+		"jayflow-web-2.0.35-dev-linux-amd64", "linux-latest.json",
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		got = append(got, entry.Name())
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("inventory = %q, want %q", got, want)
+	}
+	windowsBody, err := os.ReadFile(filepath.Join(dir, windowsLatestName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(windowsBody, windowsBefore) {
+		t.Fatal("existing Windows latest.json bytes changed")
+	}
+	if err := verifyBundle(dir, version, windowsURL, linuxURL, public); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWindowsAndLinuxManifestSignaturesCannotCross(t *testing.T) {
+	dir, version := t.TempDir(), "2.0.35-dev"
+	writeUnsignedBundleFixture(t, dir, version)
+	private := vectorPrivateKey(t)
+	public := private.Public().(ed25519.PublicKey)
+	if err := signBundle(dir, version, "https://example.invalid/JayFlow-"+version+".exe",
+		"https://example.invalid/jayflow-web-"+version+"-linux-amd64", private); err != nil {
+		t.Fatal(err)
+	}
+	read := func(name string) latestManifest {
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var manifest latestManifest
+		if err := json.Unmarshal(body, &manifest); err != nil {
+			t.Fatal(err)
+		}
+		return manifest
+	}
+	decode := func(value string) []byte {
+		raw, err := base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	windows, linux := read(windowsLatestName), read(linuxLatestName)
+	if ed25519.Verify(public, channelPayload(linuxUpdateSigningDomain, windows.Version, windows.SHA256), decode(windows.Sig)) {
+		t.Fatal("Windows crossed to Linux")
+	}
+	if ed25519.Verify(public, channelPayload(windowsUpdateSigningDomain, linux.Version, linux.SHA256), decode(linux.Sig)) {
+		t.Fatal("Linux crossed to Windows")
+	}
+}
+
+func TestReleaseManifestKeepsFourWindowsEntriesAndAppendsLinux(t *testing.T) {
+	dir, version := t.TempDir(), "2.0.35-dev"
+	writeUnsignedBundleFixture(t, dir, version)
+	private := vectorPrivateKey(t)
+	windowsURL := "https://example.invalid/JayFlow-" + version + ".exe"
+	linuxURL := "https://example.invalid/" + linuxArtifactName(version)
+	if err := signBundle(dir, version, windowsURL, linuxURL, private); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, releaseManifestName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest releaseManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Schema != "jayflow-release-v1" {
+		t.Fatalf("schema = %q", manifest.Schema)
+	}
+	want := []string{
+		"JayFlow-" + version + ".exe",
+		"JayFlow-" + version + "-setup.exe",
+		"JayFlow-setup.exe",
+		"buildinfo.txt",
+		linuxArtifactName(version),
+	}
+	got := make([]string, len(manifest.Assets))
+	for index, asset := range manifest.Assets {
+		got[index] = asset.Name
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("release manifest entries = %q, want %q", got, want)
+	}
+}
+
+func TestVerifyBundleRejectsLinuxManifestTampering(t *testing.T) {
+	version := "2.0.35-dev"
+	private := vectorPrivateKey(t)
+	public := private.Public().(ed25519.PublicKey)
+	windowsURL := "https://example.invalid/JayFlow-" + version + ".exe"
+	linuxURL := "https://example.invalid/" + linuxArtifactName(version)
+	makeBundle := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		writeUnsignedBundleFixture(t, dir, version)
+		if err := signBundle(dir, version, windowsURL, linuxURL, private); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	for name, mutate := range map[string]func(*latestManifest){
+		"URL":    func(manifest *latestManifest) { manifest.URL += ".tampered" },
+		"digest": func(manifest *latestManifest) { manifest.SHA256 = strings.Repeat("0", 64) },
+		"signature": func(manifest *latestManifest) {
+			manifest.Sig = base64.StdEncoding.EncodeToString(make([]byte, ed25519.SignatureSize))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := makeBundle(t)
+			path := filepath.Join(dir, linuxLatestName)
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var manifest latestManifest
+			if err := json.Unmarshal(body, &manifest); err != nil {
+				t.Fatal(err)
+			}
+			mutate(&manifest)
+			body, err = marshalJSON(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, body, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := verifyBundle(dir, version, windowsURL, linuxURL, public); err == nil {
+				t.Fatal("verifyBundle() accepted tampered linux-latest.json")
+			}
+		})
+	}
+}
+
+func TestVerifyBundleRejectsMalformedChecksumInventory(t *testing.T) {
+	version := "2.0.35-dev"
+	private := vectorPrivateKey(t)
+	public := private.Public().(ed25519.PublicKey)
+	windowsURL := "https://example.invalid/JayFlow-" + version + ".exe"
+	linuxURL := "https://example.invalid/" + linuxArtifactName(version)
+	for name, mutate := range map[string]func([]string) []string{
+		"omitted": func(lines []string) []string { return lines[1:] },
+		"reordered": func(lines []string) []string {
+			lines[0], lines[1] = lines[1], lines[0]
+			return lines
+		},
+		"duplicated": func(lines []string) []string { return append(lines, lines[0]) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeUnsignedBundleFixture(t, dir, version)
+			if err := signBundle(dir, version, windowsURL, linuxURL, private); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, checksumsName)
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(strings.TrimSuffix(string(body), "\n"), "\n")
+			lines = mutate(lines)
+			if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := verifyBundle(dir, version, windowsURL, linuxURL, public); err == nil {
+				t.Fatal("verifyBundle() accepted malformed checksums.txt inventory")
+			}
+		})
+	}
+}
+
+// release-manifest.json and checksums.txt hash the artifacts themselves, which
+// masks the binding that matters most: a channel manifest must describe the bytes
+// actually shipped, not merely a self-consistent signed statement. These bundles
+// are re-signed and re-checksummed, so only that binding can reject them.
+func TestVerifyBundleRejectsValidlySignedDigestTampering(t *testing.T) {
+	version := "2.0.35-dev"
+	private := vectorPrivateKey(t)
+	public := private.Public().(ed25519.PublicKey)
+	windowsURL := "https://example.invalid/JayFlow-" + version + ".exe"
+	linuxURL := "https://example.invalid/" + linuxArtifactName(version)
+	decoy := sha256.Sum256([]byte("bytes that were never published"))
+	decoyDigest := hex.EncodeToString(decoy[:])
+	makeBundle := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		writeUnsignedBundleFixture(t, dir, version)
+		if err := signBundle(dir, version, windowsURL, linuxURL, private); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	for name, domain := range map[string]string{
+		windowsLatestName: windowsUpdateSigningDomain,
+		linuxLatestName:   linuxUpdateSigningDomain,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := makeBundle(t)
+			path := filepath.Join(dir, name)
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var manifest latestManifest
+			if err := json.Unmarshal(body, &manifest); err != nil {
+				t.Fatal(err)
+			}
+			manifest.SHA256 = decoyDigest
+			manifest.Sig = base64.StdEncoding.EncodeToString(signDetached(private,
+				channelPayload(domain, manifest.Version, manifest.SHA256)))
+			body, err = marshalJSON(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, body, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			checksums, err := generateChecksums(dir, version)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, checksumsName), checksums, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := verifyBundle(dir, version, windowsURL, linuxURL, public); err == nil {
+				t.Fatalf("verifyBundle() accepted %s describing bytes that were never published", name)
+			}
+		})
+	}
+
+	t.Run("raw "+linuxLatestName+" bytes", func(t *testing.T) {
+		dir := makeBundle(t)
+		path := filepath.Join(dir, linuxLatestName)
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, append(body, ' '), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyBundle(dir, version, windowsURL, linuxURL, public); err == nil {
+			t.Fatal("verifyBundle() accepted altered linux-latest.json bytes")
+		}
+	})
+}
+
+func TestBundleRejectsSymlinkedLinuxAsset(t *testing.T) {
+	version := "2.0.35-dev"
+	private := vectorPrivateKey(t)
+	windowsURL := "https://example.invalid/JayFlow-" + version + ".exe"
+	linuxURL := "https://example.invalid/" + linuxArtifactName(version)
+	dir := t.TempDir()
+	writeUnsignedBundleFixture(t, dir, version)
+	linuxPath := filepath.Join(dir, linuxArtifactName(version))
+	if err := os.Remove(linuxPath); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "gateway")
+	if err := os.WriteFile(outside, []byte("outside"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, linuxPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := signBundle(dir, version, windowsURL, linuxURL, private); err == nil {
+		t.Fatal("signBundle() followed a symlinked Linux asset")
+	}
+}
+
+func TestBundleCLIRequiresExactWindowsAndLinuxURLs(t *testing.T) {
+	version := "2.0.35-dev"
+	private := vectorPrivateKey(t)
+	t.Setenv(privateKeyEnv, base64.StdEncoding.EncodeToString(private))
+	dir := t.TempDir()
+	writeUnsignedBundleFixture(t, dir, version)
+	windowsURL := "https://example.invalid/JayFlow-" + version + ".exe"
+	linuxURL := "https://example.invalid/" + linuxArtifactName(version)
+	if err := run([]string{"sign-bundle", "-version", version, "-dir", dir, "-portable-url", windowsURL}); err == nil {
+		t.Fatal("sign-bundle accepted a missing -linux-url")
+	}
+	if err := run([]string{"sign-bundle", "-version", version, "-dir", dir, "-portable-url", windowsURL,
+		"-linux-url", linuxURL + ".wrong"}); err == nil {
+		t.Fatal("sign-bundle accepted a Linux URL with the wrong suffix")
 	}
 }
 
@@ -418,6 +769,191 @@ func TestPortableContainsExactAuditedDaemonBytes(t *testing.T) {
 	}
 }
 
+func TestAuditLinuxAcceptsStaticStampedGatewayWithoutExecutingIt(t *testing.T) {
+	fixture := buildAuditableLinuxFixture(t, linuxFixtureOptions{})
+	executionMarker := filepath.Join(t.TempDir(), "gateway-executed")
+	t.Setenv("JAYFLOW_TEST_EXEC_MARKER", executionMarker)
+	args := []string{
+		"audit-linux",
+		"-version", fixture.version,
+		"-path", fixture.gateway,
+		"-source-sha", fixture.sourceSHA,
+		"-public-key", fixture.publicKey,
+	}
+	if err := run(args); err != nil {
+		t.Fatalf("audit-linux valid fixture error = %v", err)
+	}
+	if _, err := os.Lstat(executionMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("audit-linux executed the transported gateway")
+	}
+}
+
+func TestAuditLinuxRejectsInvalidIdentityAndFilesystemTypes(t *testing.T) {
+	fixture := buildAuditableLinuxFixture(t, linuxFixtureOptions{})
+	valid := func(path, version, sourceSHA, publicKey string) error {
+		return auditLinux(path, version, sourceSHA, publicKey)
+	}
+	t.Run("wrong version", func(t *testing.T) {
+		if err := valid(fixture.gateway, "2.0.34-dev", fixture.sourceSHA, fixture.publicKey); err == nil {
+			t.Fatal("auditLinux() accepted a wrong version")
+		}
+	})
+	t.Run("wrong source SHA", func(t *testing.T) {
+		if err := valid(fixture.gateway, fixture.version, strings.Repeat("f", 40), fixture.publicKey); err == nil {
+			t.Fatal("auditLinux() accepted a wrong source SHA")
+		}
+	})
+	t.Run("missing public key marker", func(t *testing.T) {
+		other := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{7}, ed25519.SeedSize))
+		publicKey := base64.StdEncoding.EncodeToString(other.Public().(ed25519.PublicKey))
+		if err := valid(fixture.gateway, fixture.version, fixture.sourceSHA, publicKey); err == nil {
+			t.Fatal("auditLinux() accepted a gateway without the requested public key marker")
+		}
+	})
+	t.Run("invalid public key", func(t *testing.T) {
+		if err := valid(fixture.gateway, fixture.version, fixture.sourceSHA, "not-base64"); err == nil {
+			t.Fatal("auditLinux() accepted an invalid public key")
+		}
+	})
+	t.Run("symlink", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "gateway")
+		if err := os.Symlink(fixture.gateway, path); err != nil {
+			t.Fatal(err)
+		}
+		if err := valid(path, fixture.version, fixture.sourceSHA, fixture.publicKey); err == nil {
+			t.Fatal("auditLinux() followed a symlink")
+		}
+	})
+	t.Run("FIFO", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "gateway")
+		if err := syscall.Mkfifo(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := valid(path, fixture.version, fixture.sourceSHA, fixture.publicKey); err == nil {
+			t.Fatal("auditLinux() accepted a FIFO")
+		}
+	})
+	t.Run("device", func(t *testing.T) {
+		if err := valid("/dev/null", fixture.version, fixture.sourceSHA, fixture.publicKey); err == nil {
+			t.Fatal("auditLinux() accepted a device")
+		}
+	})
+	t.Run("directory", func(t *testing.T) {
+		if err := valid(t.TempDir(), fixture.version, fixture.sourceSHA, fixture.publicKey); err == nil {
+			t.Fatal("auditLinux() accepted a directory")
+		}
+	})
+	t.Run("non executable", func(t *testing.T) {
+		path := copyLinuxFixture(t, fixture.gateway)
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := valid(path, fixture.version, fixture.sourceSHA, fixture.publicKey); err == nil {
+			t.Fatal("auditLinux() accepted a non-executable file")
+		}
+	})
+	t.Run("non ELF", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "gateway")
+		if err := os.WriteFile(path, []byte("not an ELF"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := valid(path, fixture.version, fixture.sourceSHA, fixture.publicKey); err == nil {
+			t.Fatal("auditLinux() accepted a non-ELF")
+		}
+	})
+}
+
+func TestAuditLinuxRejectsWrongELFClassDataAndMachine(t *testing.T) {
+	fixture := buildAuditableLinuxFixture(t, linuxFixtureOptions{})
+	for name, mutate := range map[string]func([]byte){
+		"class":   func(body []byte) { body[elf.EI_CLASS] = byte(elf.ELFCLASS32) },
+		"data":    func(body []byte) { body[elf.EI_DATA] = byte(elf.ELFDATA2MSB) },
+		"machine": func(body []byte) { binary.LittleEndian.PutUint16(body[18:20], uint16(elf.EM_AARCH64)) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := copyLinuxFixture(t, fixture.gateway)
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(body)
+			if err := os.WriteFile(path, body, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := auditLinux(path, fixture.version, fixture.sourceSHA, fixture.publicKey); err == nil {
+				t.Fatal("auditLinux() accepted the wrong ELF identity")
+			}
+		})
+	}
+}
+
+func TestAuditLinuxRejectsUnsafeGoBuildMetadata(t *testing.T) {
+	for name, options := range map[string]linuxFixtureOptions{
+		"vcs modified":     {dirty: true},
+		"missing trimpath": {withoutTrimpath: true},
+		"CGO enabled":      {cgoEnabled: "1"},
+		"wrong main path":  {mainPath: "cmd/not-jayflow-web"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := buildAuditableLinuxFixture(t, options)
+			if err := auditLinux(fixture.gateway, fixture.version, fixture.sourceSHA, fixture.publicKey); err == nil {
+				t.Fatal("auditLinux() accepted unsafe Go build metadata")
+			}
+		})
+	}
+}
+
+// The stamped source marker cannot prove provenance on its own: it is a plain
+// byte search, and the Go build metadata already carries the same 40 characters.
+// This gateway stamps main.SourceSHA with exactly the audited value while the
+// real commit is a different one, so only settings["vcs.revision"] can reject it.
+func TestAuditLinuxRejectsSourceRevisionDivergence(t *testing.T) {
+	stamped := strings.Repeat("a", 40)
+	fixture := buildAuditableLinuxFixture(t, linuxFixtureOptions{stampedSourceSHA: stamped})
+	if fixture.sourceSHA == stamped {
+		t.Fatal("fixture commit collided with the stamped source SHA")
+	}
+	body, err := os.ReadFile(fixture.gateway)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(stamped)) {
+		t.Fatal("fixture does not carry the stamped source marker under audit")
+	}
+	if err := auditLinux(fixture.gateway, fixture.version, stamped, fixture.publicKey); err == nil {
+		t.Fatal("auditLinux() accepted an ELF whose vcs.revision is not the audited source commit")
+	}
+}
+
+// Flipping EI_DATA in a real gateway breaks elf.NewFile before the identity
+// comparison runs, so only a structurally valid big-endian header proves that
+// the ELFDATA2LSB requirement is enforced rather than merely written down.
+func TestAuditLinuxRejectsBigEndianELFIdentity(t *testing.T) {
+	header := make([]byte, 64)
+	copy(header, []byte{0x7f, 'E', 'L', 'F'})
+	header[elf.EI_CLASS] = byte(elf.ELFCLASS64)
+	header[elf.EI_DATA] = byte(elf.ELFDATA2MSB)
+	header[elf.EI_VERSION] = byte(elf.EV_CURRENT)
+	binary.BigEndian.PutUint16(header[16:18], uint16(elf.ET_EXEC))
+	binary.BigEndian.PutUint16(header[18:20], uint16(elf.EM_X86_64))
+	binary.BigEndian.PutUint32(header[20:24], uint32(elf.EV_CURRENT))
+	binary.BigEndian.PutUint16(header[52:54], 64)
+	binary.BigEndian.PutUint16(header[54:56], 56)
+	binary.BigEndian.PutUint16(header[58:60], 64)
+	path := filepath.Join(t.TempDir(), "jayflow-web")
+	if err := os.WriteFile(path, header, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	publicKey := base64.StdEncoding.EncodeToString(vectorPrivateKey(t).Public().(ed25519.PublicKey))
+	err := auditLinux(path, "2.0.35-dev", strings.Repeat("b", 40), publicKey)
+	if err == nil {
+		t.Fatal("auditLinux() accepted a big-endian ELF64")
+	}
+	if !strings.Contains(err.Error(), "want ELF64/LSB/amd64") {
+		t.Fatalf("auditLinux() error = %v, want the ELF identity rejection", err)
+	}
+}
+
 func TestAuditWindowsAdversarialRealBinaries(t *testing.T) {
 	fixture := buildAuditableWindowsFixture(t)
 	executionMarker := filepath.Join(t.TempDir(), "daemon-executed")
@@ -555,6 +1091,110 @@ func TestAuditWindowsAdversarialRealBinaries(t *testing.T) {
 			t.Fatal("audit-windows followed a daemon symlink")
 		}
 	})
+}
+
+type linuxAuditFixture struct {
+	version   string
+	gateway   string
+	sourceSHA string
+	publicKey string
+}
+
+type linuxFixtureOptions struct {
+	dirty            bool
+	withoutTrimpath  bool
+	cgoEnabled       string
+	mainPath         string
+	stampedSourceSHA string
+}
+
+func buildAuditableLinuxFixture(t *testing.T, options linuxFixtureOptions) linuxAuditFixture {
+	t.Helper()
+	root := t.TempDir()
+	mainPath := options.mainPath
+	if mainPath == "" {
+		mainPath = "cmd/jayflow-web"
+	}
+	if err := os.MkdirAll(filepath.Join(root, mainPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "internal", "updater"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module github.com/julubileu/jayflow-v2\n\ngo 1.23.0\n")
+	writeTestFile(t, filepath.Join(root, "internal", "updater", "key.go"), `package updater
+var PublicKeyBase64 = ""
+`)
+	writeTestFile(t, filepath.Join(root, mainPath, "main.go"), `package main
+import (
+	"fmt"
+	"os"
+	"github.com/julubileu/jayflow-v2/internal/updater"
+)
+var Version = "unknown"
+var SourceSHA = "unknown"
+func main() {
+	if marker := os.Getenv("JAYFLOW_TEST_EXEC_MARKER"); marker != "" {
+		if err := os.WriteFile(marker, []byte("executed"), 0600); err != nil { panic(err) }
+	}
+	fmt.Println(Version, SourceSHA, updater.PublicKeyBase64)
+}
+`)
+	runTestCommand(t, root, nil, "git", "init", "-q")
+	runTestCommand(t, root, nil, "git", "config", "user.name", "Release Tool Test")
+	runTestCommand(t, root, nil, "git", "config", "user.email", "release-tool@example.invalid")
+	runTestCommand(t, root, nil, "git", "add", ".")
+	runTestCommand(t, root, []string{"GIT_AUTHOR_DATE=2023-11-14T22:13:20Z", "GIT_COMMITTER_DATE=2023-11-14T22:13:20Z"},
+		"git", "commit", "-q", "-m", "fixture")
+	sourceSHA := commandOutput(t, root, nil, "git", "rev-parse", "HEAD")
+	if options.dirty {
+		handle, err := os.OpenFile(filepath.Join(root, mainPath, "main.go"), os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := handle.WriteString("\n// dirty fixture\n"); err != nil {
+			t.Fatal(err)
+		}
+		if err := handle.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	version := "2.0.35-dev"
+	private := vectorPrivateKey(t)
+	publicKey := base64.StdEncoding.EncodeToString(private.Public().(ed25519.PublicKey))
+	gateway := filepath.Join(root, "jayflow-web")
+	cgoEnabled := options.cgoEnabled
+	if cgoEnabled == "" {
+		cgoEnabled = "0"
+	}
+	args := []string{"build", "-buildvcs=true"}
+	if !options.withoutTrimpath {
+		args = append(args, "-trimpath")
+	}
+	stampedSourceSHA := options.stampedSourceSHA
+	if stampedSourceSHA == "" {
+		stampedSourceSHA = sourceSHA
+	}
+	ldflags := "-s -w"
+	ldflags += " -X main.Version=" + version
+	ldflags += " -X main.SourceSHA=" + stampedSourceSHA
+	ldflags += " -X github.com/julubileu/jayflow-v2/internal/updater.PublicKeyBase64=" + publicKey
+	args = append(args, "-ldflags="+ldflags, "-o", gateway, "./"+mainPath)
+	runTestCommand(t, root, []string{"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=" + cgoEnabled}, "go", args...)
+	return linuxAuditFixture{version: version, gateway: gateway, sourceSHA: sourceSHA, publicKey: publicKey}
+}
+
+func copyLinuxFixture(t *testing.T, source string) string {
+	t.Helper()
+	body, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "jayflow-web")
+	if err := os.WriteFile(path, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 type windowsAuditFixture struct {
@@ -793,10 +1433,18 @@ func vectorPrivateKey(t *testing.T) ed25519.PrivateKey {
 func writeUnsignedFixture(t *testing.T, dir, version string) {
 	t.Helper()
 	contents := []string{"portable", "versioned installer", "versioned installer", "build info"}
-	for index, name := range unsignedAssetNames(version) {
+	for index, name := range windowsUnsignedAssetNames(version) {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(contents[index]), 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func writeUnsignedBundleFixture(t *testing.T, dir, version string) {
+	t.Helper()
+	writeUnsignedFixture(t, dir, version)
+	if err := os.WriteFile(filepath.Join(dir, linuxArtifactName(version)), []byte("linux gateway fixture\n"), 0o755); err != nil {
+		t.Fatal(err)
 	}
 }
 
