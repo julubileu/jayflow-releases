@@ -1151,6 +1151,64 @@ jobs:
             }
           done
 
+      - name: Collect acceptance diagnostics
+        # The harness removes the disposable user and both units in its trap, so
+        # this is the last moment at which the runner can still be asked why the
+        # user unit refused to start. Failure only, read only, printed into this
+        # job log and nowhere else: the job holds no secret beyond the read-only
+        # deploy key pinned to its checkout, nothing is uploaded, and nothing
+        # here leaves the runner or modifies it.
+        if: failure()
+        run: |
+          set -euo pipefail
+          ACCEPTANCE_LOG="$RUNNER_TEMP/mobile-release-acceptance.log"
+          echo "::group::acceptance transcript"
+          # failure() also fires for a step before the acceptance, so the
+          # transcript may legitimately not exist yet.
+          if [ -f "$ACCEPTANCE_LOG" ]; then
+            cat "$ACCEPTANCE_LOG"
+          else
+            echo "no acceptance transcript at $ACCEPTANCE_LOG"
+          fi
+          echo "::endgroup::"
+          echo "::group::system journal"
+          # The system journal is the one witness that outlives the harness
+          # trap, and the only read here that root is needed for. `|| true`
+          # explicitly: a filter that matches nothing, or a journal this runner
+          # declines, must not replace the acceptance failure with its own.
+          sudo journalctl --no-pager -o short-iso --since '-30 min' \
+            | grep -E 'jayflow|jfrel|user@|logind|linger|apparmor|securepath|Failed|failed' \
+            | tail -n 300 || true
+          echo "::endgroup::"
+          echo "::group::logind sessions"
+          # No lingering user and no /run/user is the shape of a user manager
+          # that was never started. `|| true` explicitly, because on a runner
+          # that never got that far both probes are legitimately empty or absent.
+          loginctl list-users --no-legend || true
+          ls -la /run/user || true
+          echo "::endgroup::"
+          echo "::group::userns policy"
+          # Both keys are Ubuntu-specific and either may simply not exist on
+          # this image, which is not itself a diagnosis, so this read is
+          # tolerated explicitly with || true.
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone || true
+          echo "::endgroup::"
+          echo "::group::runner layout"
+          # Mode and owner of the parent of the disposable home, and whether the
+          # scratch filesystems are the shape the daemon fixture expects.
+          # `|| true` explicitly: a path that is absent is itself the answer.
+          stat -c '%a %U:%G %n' /home /run/user /tmp /dev/shm || true
+          mount | grep -E '/home|/tmp|/dev/shm|/run/user' || true
+          echo "::endgroup::"
+          echo "::group::identity and platform"
+          id
+          uname -r
+          # `head` closes the pipe early, and under pipefail the writer's
+          # SIGPIPE would fail the step, so both reads are tolerated explicitly.
+          systemctl --version | head -1 || true
+          cat /etc/os-release | head -3 || true
+          echo "::endgroup::"
+
   sign_publish:
     name: Sign and publish without private source
     needs: [build_windows, build_linux, accept_linux]

@@ -224,6 +224,7 @@ require_order(names(accept_steps), [
     "Expose the runner browser as Chromium",
     "Install acceptance frontend dependencies",
     "Run real-systemd and Playwright acceptance",
+    "Collect acceptance diagnostics",
 ], "accept_linux")
 require_order(names(sign_steps), [
     "Check out only the public release repository",
@@ -932,6 +933,28 @@ GATE_TMPFS_PATTERN = re.compile(r"(?<![\w./-])" + re.escape(GATE_TMPFS) + r"(?![
 
 def names_gate_tmpfs(text):
     return GATE_TMPFS_PATTERN.search(text) is not None
+
+
+# The failure-only diagnostics step in accept_linux has to name /tmp and
+# /dev/shm: their mode and their filesystem are two of the four facts that
+# separate "the runner's /home refuses the disposable home" from "the user
+# manager never got a /run/user". That is a read of the runner's layout, not a
+# provisioning of a gate scratch, so it is scoped down to these two exact lines
+# instead of being forbidden outright: everywhere else in the job, naming either
+# path still means the gate environment leaked in.
+ACCEPT_DIAGNOSTICS_STEP_NAME = "Collect acceptance diagnostics"
+ACCEPT_DIAGNOSTICS_LAYOUT_LINES = (
+    "stat -c '%a %U:%G %n' /home /run/user /tmp /dev/shm",
+    "mount | grep -E '/home|/tmp|/dev/shm|/run/user'",
+)
+
+
+def without_diagnostics_layout(text):
+    for line in ACCEPT_DIAGNOSTICS_LAYOUT_LINES:
+        text = text.replace(line, "")
+    return text
+
+
 # 2 GiB. One focused gate run holds the Go build work directories, the traced
 # gateway instances and the SQLite scratch under TMPDIR at the same time, and a
 # tmpfs is charged against the runner's RAM. Below that floor the run dies of
@@ -1157,9 +1180,14 @@ for job_name, steps in (
     for step in steps:
         if "TMPDIR" in step.get("env", {}):
             tmpdir_steps.append((job_name, step.get("name")))
-        if names_gate_tmpfs(serialized(step)):
+        # Only the two pinned read-only layout lines of the acceptance
+        # diagnostics are exempt, and only inside that one step.
+        scan = serialized(step)
+        if job_name == "accept_linux" and step.get("name") == ACCEPT_DIAGNOSTICS_STEP_NAME:
+            scan = without_diagnostics_layout(scan)
+        if names_gate_tmpfs(scan):
             tmpfs_steps.append((job_name, step.get("name")))
-        if GATE_FOREIGN_TMPFS in serialized(step):
+        if GATE_FOREIGN_TMPFS in scan:
             foreign_steps.append((job_name, step.get("name")))
 if tmpdir_steps != list(GATE_STEPS):
     raise SystemExit(
@@ -1242,6 +1270,23 @@ for label, script, expected in (
     if found != expected:
         raise SystemExit(f"gate {label} elevations are {found}, want {expected}")
 
+# Each pinned layout line may appear exactly once in the whole job, and only
+# inside the diagnostics step: anywhere else, or twice, and the exemption below
+# would be laundering a second use of the gate scratch.
+accept_diagnostics_steps = [
+    step for step in accept_steps if step.get("name") == ACCEPT_DIAGNOSTICS_STEP_NAME
+]
+for line in ACCEPT_DIAGNOSTICS_LAYOUT_LINES:
+    if accept_text.count(line) != 1:
+        raise SystemExit(
+            f"the acceptance layout probe {line!r} must appear exactly once in accept_linux"
+        )
+    if len(accept_diagnostics_steps) != 1 or line not in serialized(accept_diagnostics_steps[0]):
+        raise SystemExit(
+            f"only {ACCEPT_DIAGNOSTICS_STEP_NAME!r} may name the runner layout: {line!r}"
+        )
+accept_scan_text = without_diagnostics_layout(accept_text)
+
 for forbidden in (
     "JAYFLOW_LOCAL_GATE_ROOT",
     "jayflow-gate",
@@ -1253,9 +1298,9 @@ for forbidden in (
 ):
     if forbidden in sign_text:
         raise SystemExit(f"the signing job must never receive the private gate environment: {forbidden}")
-    if forbidden in accept_text:
+    if forbidden in accept_scan_text:
         raise SystemExit(f"the transported-byte acceptance job must not carry the gate environment: {forbidden}")
-for label, text in (("signing job", sign_text), ("transported-byte acceptance job", accept_text)):
+for label, text in (("signing job", sign_text), ("transported-byte acceptance job", accept_scan_text)):
     if names_gate_tmpfs(text):
         raise SystemExit(f"the {label} must never name the gate scratch {GATE_TMPFS}")
 for job_name, steps in (("build_windows", windows_steps), ("build_linux", linux_steps)):
@@ -1966,6 +2011,208 @@ exit 0
         result = checked(["bash", "-c", acceptance_script], cwd=accept_temp, env=failing_env)
         if result.returncode == 0:
             raise SystemExit(f"accept_linux accepted injected failure {failure}")
+
+
+def elevations_in(script):
+    """Every command in `script` that reaches for root, comments excluded."""
+    found = []
+    for line in script.splitlines():
+        if line.strip().startswith("#"):
+            continue
+        for match in re.finditer(r"sudo\b[^\n]*", line):
+            found.append(match.group(0).strip().rstrip("\\").strip())
+    return found
+
+
+# The sudo audit that follows is scoped to one script, so the job's step list is
+# closed here: an extra step appended anywhere in accept_linux would otherwise
+# be free to elevate for whatever it liked, and require_order alone tolerates
+# unlisted steps.
+ACCEPT_STEP_NAMES = (
+    "Check out public release tooling",
+    "Check out the private source from the Linux build",
+    "Verify accepted source identity",
+    "Set up Go from the accepted source go.mod",
+    "Build the trusted public auditor",
+    "Download the transported Linux gateway",
+    "Build the acceptance daemon",
+    "Audit transported Linux bytes",
+    "Set up Node.js",
+    "Expose the runner browser as Chromium",
+    "Install acceptance frontend dependencies",
+    "Run real-systemd and Playwright acceptance",
+    ACCEPT_DIAGNOSTICS_STEP_NAME,
+)
+if tuple(names(accept_steps)) != ACCEPT_STEP_NAMES:
+    raise SystemExit(
+        f"accept_linux steps are {names(accept_steps)}, want exactly {list(ACCEPT_STEP_NAMES)}"
+    )
+# And the whole job may reach for root exactly three times, each pinned by name
+# and by target: the symlink that exposes the runner's browser, the harness
+# itself, and the system journal the diagnostics read.
+ACCEPT_ELEVATIONS = (
+    'sudo ln -sfn -- "$CHROMIUM_SOURCE" /usr/bin/chromium',
+    "sudo --preserve-env=JAYFLOW_CHROMIUM,JAYFLOW_SYSTEMD_TEST,JAYFLOW_DISPOSABLE_CONFIRM",
+    "sudo journalctl --no-pager -o short-iso --since '-30 min'",
+)
+accept_elevations = [
+    elevation for step in accept_steps for elevation in elevations_in(step.get("run", ""))
+]
+if sorted(accept_elevations) != sorted(ACCEPT_ELEVATIONS):
+    raise SystemExit(
+        f"accept_linux elevates for {sorted(accept_elevations)}, want exactly {sorted(ACCEPT_ELEVATIONS)}"
+    )
+
+# ---- failure-only acceptance diagnostics -----------------------------------
+# The harness removes the disposable user and both units in its trap, so when
+# the acceptance dies with "the daemon fixture did not become active" the runner
+# state that would name the cause is already gone by the time the job ends. The
+# system journal is the one witness that outlives the userdel, and nothing in
+# this job collects it. This step is that collection, and it is deliberately
+# inert on a green run: it reads, it never writes, it never leaves the runner,
+# and it can only run after the acceptance has already failed.
+diagnostics_step = step_named(accept_steps, ACCEPT_DIAGNOSTICS_STEP_NAME)
+if accept_steps.index(diagnostics_step) != accept_steps.index(acceptance_step) + 1:
+    raise SystemExit(
+        "acceptance diagnostics must be the step immediately after the acceptance itself"
+    )
+# `if: failure()` and nothing weaker: on a green run this step must not add a
+# single line, and a diagnostics step that ran unconditionally would also run
+# before the transcript it is meant to explain even exists.
+if diagnostics_step.get("if") != "failure()":
+    raise SystemExit("acceptance diagnostics must run only with if: failure()")
+if "uses" in diagnostics_step:
+    raise SystemExit(
+        "acceptance diagnostics must be a plain run step: no action, and above all no upload"
+    )
+# No env of its own is the strongest available statement that no secret is in
+# scope: RUNNER_TEMP already comes from the runner. The job holds only the
+# read-only deploy key, pinned to its private checkout, and the job permissions
+# stay contents: read (asserted with the other read-only jobs above).
+if "env" in diagnostics_step:
+    raise SystemExit("acceptance diagnostics must not introduce environment of its own")
+if "working-directory" in diagnostics_step:
+    raise SystemExit("acceptance diagnostics must not run inside the private source checkout")
+diagnostics_text = serialized(diagnostics_step)
+if re.search(r"secrets\.|vars\.|JAYFLOW_SOURCE_DEPLOY_KEY|JAYFLOW_RELEASE_PRIVATE_KEY", diagnostics_text):
+    raise SystemExit("acceptance diagnostics must not reach for any secret or repository variable")
+# A gate that is allowed to fail is not a gate, and a diagnostics step that is
+# allowed to fail would hide the very truncation it exists to prevent.
+for step in accept_steps:
+    if "continue-on-error" in step:
+        raise SystemExit(
+            f"accept_linux/{step.get('name')!r} must not be allowed to fail silently: continue-on-error"
+        )
+diagnostics_script = diagnostics_step["run"]
+# Read-only and offline: the diagnosis is printed into the job log, never
+# uploaded, never sent anywhere, and nothing on the runner is modified.
+for forbidden in (
+    "curl ", "wget ", "ssh ", "scp ", "nc -", "http://", "https://",
+    "gh api", "gh release", "gh run", "upload-artifact",
+    "rm -", "chmod ", "chown ", "mkdir ", "systemctl start", "systemctl stop",
+    "userdel", "useradd", ">>", "tee ",
+):
+    if forbidden in diagnostics_script:
+        raise SystemExit(f"acceptance diagnostics must only read and print, found: {forbidden}")
+# Exactly one elevation, and only for the system journal: it is the only fact
+# here that an unprivileged read cannot reach.
+DIAGNOSTICS_JOURNAL = "sudo journalctl --no-pager -o short-iso --since '-30 min'"
+elevations = elevations_in(diagnostics_script)
+if elevations != [DIAGNOSTICS_JOURNAL]:
+    raise SystemExit(
+        f"acceptance diagnostics may elevate only for {DIAGNOSTICS_JOURNAL!r}, found {elevations}"
+    )
+for required in (
+    'ACCEPTANCE_LOG="$RUNNER_TEMP/mobile-release-acceptance.log"',
+    'cat "$ACCEPTANCE_LOG"',
+    DIAGNOSTICS_JOURNAL,
+    "grep -E 'jayflow|jfrel|user@|logind|linger|apparmor|securepath|Failed|failed'",
+    "tail -n 300",
+    "loginctl list-users --no-legend",
+    "ls -la /run/user",
+    "systemctl --version | head -1",
+    "cat /etc/os-release | head -3",
+    "uname -r",
+) + ACCEPT_DIAGNOSTICS_LAYOUT_LINES:
+    if required not in diagnostics_script:
+        raise SystemExit(f"acceptance diagnostics does not collect: {required}")
+# `id` on a line of its own: which user the elevated harness actually ran as.
+if not re.search(r"(?m)^\s*id\s*$", diagnostics_script):
+    raise SystemExit("acceptance diagnostics must print id on a line of its own")
+# Neither userns key is guaranteed to exist on the runner image, and a missing
+# key is not itself the diagnosis, so the read is explicitly tolerated - and the
+# tolerance carries the comment that says why, because a bare `|| true` next to
+# a sysctl is exactly how a real failure gets swallowed by accident later.
+DIAGNOSTICS_SYSCTL = (
+    "sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone || true"
+)
+diagnostics_lines = diagnostics_script.splitlines()
+sysctl_positions = [
+    index for index, line in enumerate(diagnostics_lines) if line.strip() == DIAGNOSTICS_SYSCTL
+]
+if len(sysctl_positions) != 1:
+    raise SystemExit(
+        "acceptance diagnostics must read both userns keys exactly once, tolerated with || true"
+    )
+if not any(
+    diagnostics_lines[index].strip().startswith("#")
+    for index in range(max(0, sysctl_positions[0] - 3), sysctl_positions[0])
+):
+    raise SystemExit("the tolerated userns sysctl read must carry the comment that says why")
+# Behavioural: the step exists to print everything, so it must survive every
+# probe that legitimately fails on a runner - a filter that matches nothing, an
+# absent sysctl key, a journal it is refused - and it must still print the
+# transcript and reach the last probe. A `set -e` abort halfway through is the
+# failure mode this catches.
+with tempfile.TemporaryDirectory() as diag_text:
+    diag_root = pathlib.Path(diag_text)
+    diag_bin = diag_root / "bin"
+    diag_bin.mkdir()
+    for tool_name, body in (
+        # A journal with no matching line at all: the grep filter exits 1.
+        ("journalctl", "printf 'unrelated runner chatter\\n'\nexit 0\n"),
+        ("loginctl", "exit 1\n"),
+        # Neither key present, exactly like a kernel without the Ubuntu patch.
+        ("sysctl", "printf 'sysctl: cannot stat %s\\n' \"$*\" >&2\nexit 255\n"),
+        ("systemctl", "printf 'systemd 255 (255.4)\\nmore\\nlines\\n'\n"),
+        ("mount", "printf 'proc on /proc type proc (rw)\\n'\n"),
+    ):
+        stub = diag_bin / tool_name
+        stub.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+        stub.chmod(0o755)
+    # The elevation must also tolerate a journal it is refused.
+    sudo_stub = diag_bin / "sudo"
+    sudo_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        '[ "${FAKE_DIAG_JOURNAL:-}" != refused ] || exit 1\n'
+        'exec "$@"\n',
+        encoding="utf-8",
+    )
+    sudo_stub.chmod(0o755)
+    diag_env = safe_env.copy()
+    diag_env["PATH"] = str(diag_bin) + os.pathsep + safe_env["PATH"]
+    diag_env["RUNNER_TEMP"] = str(diag_root / "runner")
+    pathlib.Path(diag_env["RUNNER_TEMP"]).mkdir()
+    transcript = pathlib.Path(diag_env["RUNNER_TEMP"]) / "mobile-release-acceptance.log"
+    transcript.write_text(
+        "mobile-release-systemd: the daemon fixture did not become active\n", encoding="utf-8"
+    )
+    result = checked(["bash", "-c", diagnostics_script], cwd=diag_root, env=diag_env)
+    require_success(result, "behavioral acceptance diagnostics")
+    if "the daemon fixture did not become active" not in result.stdout:
+        raise SystemExit("acceptance diagnostics did not print the acceptance transcript")
+    # The last probe of the step, so its output proves nothing aborted earlier.
+    if "ID=" not in result.stdout:
+        raise SystemExit("acceptance diagnostics stopped before printing /etc/os-release")
+    # `if: failure()` also fires when a step before the acceptance failed, so
+    # there may be no transcript at all: that must be reported, not fatal.
+    transcript.unlink()
+    refused_env = diag_env.copy()
+    refused_env["FAKE_DIAG_JOURNAL"] = "refused"
+    result = checked(["bash", "-c", diagnostics_script], cwd=diag_root, env=refused_env)
+    require_success(result, "behavioral acceptance diagnostics without a transcript")
+    if "mobile-release-acceptance.log" not in result.stdout:
+        raise SystemExit("acceptance diagnostics must name the transcript it could not find")
 
 nsis_install = scripts["Install NSIS and expose the runner browser as Chromium"]
 for required in (
