@@ -4,7 +4,7 @@ Este repositório público distribui os binários oficiais do JayFlow. O código
 
 ## Instalação recomendada por usuário
 
-O alvo inicial deste workflow é `2.0.33-dev`, uma versão de desenvolvimento — não uma versão estável. Baixe o [`JayFlow-setup.exe`](https://github.com/julubileu/jayflow-releases/releases/latest/download/JayFlow-setup.exe) correspondente à release que você pretende testar e execute-o no Windows x64. A página [Releases/latest](https://github.com/julubileu/jayflow-releases/releases/latest) mostra a versão atual, notas, checksums e informações exatas do build.
+O alvo deste contrato de release é `2.0.35-dev`, uma versão de desenvolvimento, não uma versão estável. Esta documentação não anuncia que a versão já foi publicada. Para Windows x64, baixe o [`JayFlow-setup.exe`](https://github.com/julubileu/jayflow-releases/releases/latest/download/JayFlow-setup.exe) correspondente à release que você pretende testar e execute-o. A página [Releases/latest](https://github.com/julubileu/jayflow-releases/releases/latest) mostra a versão efetivamente atual, notas, checksums e informações exatas do build.
 
 O setup NSIS instala o JayFlow por usuário, em uma pasta gravável sem elevação administrativa, e mantém um nome estável para automação e documentação. Esse escopo é necessário para que o updater consiga substituir o executável ao lado da aplicação sem depender de privilégios de administrador ou de escrita em `Program Files`. O Windows pode solicitar a instalação ou atualização do Microsoft Edge WebView2, componente usado pela interface do JayFlow.
 
@@ -18,45 +18,77 @@ Cada release também contém `JayFlow-X.Y.Z.exe`. Essa edição portátil é út
 
 O portátil não substitui as conveniências do setup. Se uma política corporativa bloquear o executável, peça a liberação pelo hash publicado em `checksums.txt`; não desative o antivírus ou as proteções do Windows.
 
+## Gateway Mobile no Linux
+
+O asset `jayflow-web-X.Y.Z-linux-amd64` é o gateway do JayFlow Mobile para Linux x86-64; ele não substitui o aplicativo desktop Windows nem o daemon `jayflowd`. O fluxo suportado chama `jayflow-web service install-unit` sem `sudo`, instala `jayflow-web.service` no systemd do usuário e gerencia estes caminhos fixos pertencentes somente ao gateway:
+
+- configuração: `~/.config/jayflow-web/config.json`;
+- unit: `~/.config/systemd/user/jayflow-web.service`;
+- dados, releases e estado de atualização: `~/.local/share/jayflow-web`, incluindo `releases/current`, `releases/previous`, `update-pending.json` e `update-ok/`;
+- estado operacional: `~/.local/state/jayflow-web`.
+
+A unit executa somente `~/.local/share/jayflow-web/releases/current/jayflow-web`, usa `UMask=0077`, reinicia em caso de falha e recebe permissão de escrita apenas nos caminhos do próprio gateway. A origem HTTP/HTTPS do gateway fica restrita ao loopback; qualquer exposição por Cloudflare é uma etapa separada de provisionamento e administração da conta, fora do instalador e do updater.
+
+Na instalação ou atualização, o fluxo suportado valida o artefato e seu digest assinado, executa o preflight offline, grava um executável em um diretório versionado e só então alterna atomicamente `previous` e `current`. Instalações externas reiniciam apenas o gateway com `systemctl --user restart jayflow-web.service`; uma atualização iniciada pelo próprio gateway faz `exec` do novo `current`, permanecendo sob supervisão da mesma unit.
+
+O candidato tem 30 segundos para marcar readiness depois que configuração, banco de dados, autenticação, servidor de loopback e ligação com o daemon estiverem prontos. Se isso não ocorrer, o fluxo restaura `previous`, encerra uma vez com erro e deixa o systemd iniciar o alvo restaurado. Os binários versionados são retidos. Editar manualmente os links `current` ou `previous` não é um caminho de instalação, atualização ou rollback suportado.
+
+Nem a atualização nem o rollback do gateway sinalizam, reiniciam, substituem ou removem `jayflowd`. Eles também não removem sessões de agentes, `~/.jayflow`, túneis, DNS ou outros recursos da conta Cloudflare.
+
 ## Atualizações assinadas
 
-O JayFlow consulta publicamente `latest.json` e baixa o executável versionado desta página de releases. O manifesto contém a versão, a URL e o SHA-256 do binário; versão e digest são assinados com Ed25519. O aplicativo traz somente a chave pública e só aceita bytes cujo hash e assinatura sejam válidos.
+O aplicativo Windows consulta publicamente `latest.json`; o gateway Linux consulta somente `linux-latest.json`. Cada manifesto contém a versão, a URL e o SHA-256 do executável correspondente. Versão e digest são assinados com Ed25519, e cada cliente traz somente a chave pública e só aceita bytes cujo hash e assinatura sejam válidos.
 
-Não há PAT, chave privada ou credencial de GitHub embutida no aplicativo. A atualização pública não depende de túnel, porta adicional ou acesso da VM ao GitHub. A chave privada de release existe somente como secret do workflow; o repositório usa uma deploy key separada e somente leitura para obter o código privado durante o build.
+`latest.json` continua exclusivo do Windows e assina `jayflow-update-v1\n<version>\n<sha256>\n`. `linux-latest.json` é exclusivo do gateway Linux e assina `jayflow-linux-update-v1\n<version>\n<sha256>\n`. Os dois canais usam o mesmo par de chaves, mas os domínios distintos impedem que uma assinatura válida de um canal seja reaproveitada no outro. A URL fica fora do payload assinado; HTTPS entrega o manifesto e o digest assinado fixa os bytes aceitos.
 
-Cada release tem oito assets e nenhum nome adicional:
+Não há PAT, chave privada ou credencial de GitHub embutida nos executáveis. O updater Windows não depende de túnel, porta adicional ou acesso da VM ao GitHub; o gateway Linux usa somente HTTPS de saída para ler sua release pública, sem credencial de GitHub e sem envolver Cloudflare. A chave privada de release existe somente como secret do workflow; o repositório usa uma deploy key separada e somente leitura para obter o código privado durante o build.
+
+Cada release desse contrato tem exatamente dez arquivos regulares, sem diretórios, symlinks ou nomes adicionais:
 
 - `JayFlow-X.Y.Z.exe`, portátil;
 - `JayFlow-X.Y.Z-setup.exe` e `JayFlow-setup.exe`, dois nomes para os mesmos bytes finais do setup;
 - `buildinfo.txt`, com tag, commit, versão Windows e escopo do instalador;
 - `latest.json`, manifesto do updater com assinatura Ed25519 sobre `jayflow-update-v1\n<version>\n<sha256>\n`;
-- `release-manifest.json` e sua assinatura destacada `release-manifest.sig`, que autenticam nome, tamanho e SHA-256 do portátil, dos dois nomes do setup e do buildinfo;
-- `checksums.txt`, que registra os SHA-256 desses quatro arquivos e dos três metadados assinados. Ele não contém um auto-hash impossível.
+- `release-manifest.json` e sua assinatura destacada `release-manifest.sig`, que preservam os quatro itens Windows na ordem existente e acrescentam, como quinto item, o nome, tamanho e SHA-256 do ELF Linux;
+- `checksums.txt`, que registra os SHA-256 dos cinco assets unsigned, dos dois manifestos de canal, de `release-manifest.json` e de `release-manifest.sig`. Ele não contém um auto-hash impossível;
+- `jayflow-web-X.Y.Z-linux-amd64`, ELF64 estático para Linux/amd64, instalado como serviço de usuário pelo fluxo Mobile;
+- `linux-latest.json`, manifesto exclusivo do gateway com assinatura Ed25519 sobre `jayflow-linux-update-v1\n<version>\n<sha256>\n`.
 
-O build e a assinatura rodam em jobs/runners separados. O primeiro recebe somente a deploy key read-only do fonte privado e envia os quatro assets unsigned por um artifact interno. O ELF `jayflowd` já auditado viaja em outro artifact interno, fora de `dist`, e nunca é publicado. O segundo faz checkout somente deste repositório público, compila o auditor antes de receber a chave Ed25519, baixa os dois artifacts e confirma estaticamente que o PE contém todos os bytes do mesmo ELF. O ELF não é executado nesse job. Só depois dessa auditoria o secret é disponibilizado aos passos mínimos de derivação e assinatura.
+Assim, o manifesto agregado assinado autentica os cinco arquivos distribuídos como executáveis ou evidência de build, os dois manifestos de canal fixam seus executáveis de forma independente e `checksums.txt` reconcilia os outros nove arquivos. O inventário exato e a recomputação determinística fazem o verificador rejeitar qualquer byte ausente, extra ou divergente.
 
-A tag, o commit e os binários também são ligados entre si. `buildinfo.txt` deve conter exatamente a ref e o SHA validados, e o `vcs.revision` gravado pelo Go no portátil deve ser o mesmo SHA. O pipeline deriva `SOURCE_DATE_EPOCH` do timestamp desse commit, constrói aplicativo e setup NSIS duas vezes a partir das mesmas entradas, remove os outputs entre as execuções e exige igualdade byte a byte. Apenas o segundo build é encaminhado para assinatura.
+Os builds Windows e Linux, a aceitação Linux e a assinatura/publicação ocupam jobs/runners separados. Os jobs de build e aceitação recebem somente acesso read-only ao fonte privado e não podem publicar nem assinar. O `jayflowd` auditado viaja em artifact interno próprio, fora dos assets públicos, e nunca é publicado separadamente. O job final faz checkout somente deste repositório público, compila o auditor antes de receber a chave Ed25519 e inspeciona estaticamente os executáveis transportados; ele não executa o ELF Linux. Só depois dessas auditorias o secret é disponibilizado aos passos mínimos de derivação e assinatura.
+
+A tag, o commit e os binários também são ligados entre si. `buildinfo.txt` deve conter exatamente a ref e o SHA validados, e o `vcs.revision` gravado pelo Go no portátil deve ser o mesmo SHA. O gateway transportado deve ser ELF64 little-endian `x86-64`, `linux/amd64`, executável, compilado com `CGO_ENABLED=0` e `-trimpath`, conter `vcs.modified=false` e o mesmo `source_sha`, e carregar a versão, o SHA da fonte e a chave pública estampados. O job que possui a fonte executa `version --json`; o job que possui a chave privada realiza apenas auditoria estática do ELF.
+
+O pipeline deriva `SOURCE_DATE_EPOCH` do timestamp do mesmo commit e constrói os artefatos duas vezes a partir das mesmas entradas, com limpeza dos outputs e exigência de igualdade byte a byte. Apenas o segundo build é encaminhado para assinatura.
 
 ## Verificação manual
 
-Baixe os oito assets da mesma release para um diretório sem arquivos extras. Obtenha a chave pública Ed25519 por um canal independente e confiável — por exemplo, do build JayFlow já confiável que a incorpora — e não do conjunto de arquivos que está sendo verificado. A partir de um checkout confiável deste repositório, compile e execute o verificador padrão:
+Baixe os dez assets da mesma release para um diretório sem arquivos extras. Obtenha a chave pública Ed25519 por um canal independente e confiável, por exemplo de um build JayFlow já confiável que a incorpora, e nunca de um arquivo baixado da própria release que está sendo verificada. A partir de um checkout confiável deste repositório, compile e verifique o bundle e o ELF Linux:
 
 ```bash
 go build -trimpath -o ./jayflow-release-tool ./cmd/release-tool
 ./jayflow-release-tool verify-bundle \
-  -version 2.0.33-dev \
-  -dir /caminho/para/os/assets \
-  -portable-url https://github.com/julubileu/jayflow-releases/releases/download/v2.0.33-dev/JayFlow-2.0.33-dev.exe \
+  -version 2.0.35-dev \
+  -dir /caminho/para/os/dez-assets \
+  -portable-url https://github.com/julubileu/jayflow-releases/releases/download/v2.0.35-dev/JayFlow-2.0.35-dev.exe \
+  -linux-url https://github.com/julubileu/jayflow-releases/releases/download/v2.0.35-dev/jayflow-web-2.0.35-dev-linux-amd64 \
+  -public-key "$JAYFLOW_RELEASE_PUBLIC_KEY"
+
+./jayflow-release-tool audit-linux \
+  -version 2.0.35-dev \
+  -path /caminho/para/os/dez-assets/jayflow-web-2.0.35-dev-linux-amd64 \
+  -source-sha 0123456789abcdef0123456789abcdef01234567 \
   -public-key "$JAYFLOW_RELEASE_PUBLIC_KEY"
 ```
 
-`verify-bundle` rejeita arquivo ausente ou extra, valida as duas assinaturas Ed25519, recalcula todos os hashes e tamanhos autenticados, confere `checksums.txt`, exige que os dois setups sejam idênticos e compara o `latest.json` aos bytes do portátil. Como conferência adicional sem autenticação de origem, `sha256sum -c checksums.txt` também pode ser usado dentro do diretório.
+O SHA de 40 caracteres acima é apenas ilustrativo: substitua-o pelo `source_sha` publicado nas notas da release ou na evidência do build. `verify-bundle` rejeita arquivo ausente ou extra, valida as assinaturas Ed25519 do manifesto agregado e dos dois canais em seus domínios próprios, recalcula hashes e tamanhos, confere `checksums.txt`, exige que os dois setups sejam idênticos e compara cada manifesto de canal aos bytes do executável correspondente. `audit-linux` confirma estaticamente formato ELF, plataforma, `CGO_ENABLED=0`, `-trimpath`, VCS limpo, `source_sha` e marcadores estampados sem executar o arquivo transportado. Como conferência adicional sem autenticação de origem, `sha256sum -c checksums.txt` também pode ser usado dentro do diretório.
 
-A publicação ocorre como draft: primeiro os binários e metadados, depois `latest.json` isoladamente e por último a promoção para release pública/latest. Uma release já pública é imutável: o rerun baixa exatamente os oito assets, rejeita ausências e extras, valida cada byte e somente atualiza as notas quando tudo é idêntico.
+Quando uma publicação for autorizada, ela permanecerá como draft durante upload e verificação remota: primeiro o conjunto que não é manifesto de canal, depois `latest.json` e, por último, `linux-latest.json`. Somente um bundle remoto com os dez arquivos baixados novamente, verificados e idênticos poderá ser promovido para release pública/latest. Uma release já pública é imutável: um rerun rejeita ausências, extras ou bytes diferentes e somente pode atualizar as notas quando os dez assets forem idênticos.
 
 ## Requisitos da VM
 
-O JayFlow é instalado apenas no PC Windows. Para usar agentes remotos, cadastre uma VM com:
+O aplicativo desktop JayFlow continua instalado apenas no PC Windows. No fluxo Mobile, o gateway de usuário descrito acima roda no Linux; para usar agentes remotos, cadastre uma VM com:
 
 - Linux x86-64 (`amd64`) acessível por SSH;
 - autenticação SSH válida e chave do host verificável;
@@ -64,7 +96,7 @@ O JayFlow é instalado apenas no PC Windows. Para usar agentes remotos, cadastre
 - permissão de escrita do usuário em `~/.jayflow` e espaço livre para binário, logs e sessões;
 - as CLIs que você pretende usar, como Claude Code ou Codex, instaladas e autenticadas para esse usuário.
 
-O aplicativo leva dentro de si o `jayflowd` Linux da mesma versão e o instala/atualiza em `~/.jayflow/bin` via SFTP. Não é necessário instalar JayFlow na VM, usar `sudo`, abrir uma porta TCP para o daemon ou criar um túnel reverso. Um reboot da VM encerra os processos e sessões que estavam em execução.
+O aplicativo desktop leva dentro de si o `jayflowd` Linux da mesma versão e o instala/atualiza em `~/.jayflow/bin` via SFTP. Não é necessário instalar o aplicativo desktop na VM, usar `sudo`, abrir uma porta TCP para o daemon ou criar um túnel reverso. Um reboot da VM encerra os processos e sessões que estavam em execução.
 
 ## Diagnóstico
 
