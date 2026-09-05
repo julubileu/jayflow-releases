@@ -189,6 +189,61 @@ jobs:
           grep -Fq 'VIProductVersion "${INFO_PRODUCTVERSION}.0"' "$NSIS_TEMPLATE"
           grep -Fq 'VIFileVersion    "${INFO_PRODUCTVERSION}.0"' "$NSIS_TEMPLATE"
 
+      - name: Prepare the private source gate environment
+        env:
+          STRACE_URL: https://github.com/strace/strace/releases/download/v7.1/strace-7.1.tar.xz
+          STRACE_SHA256: 81743ecf2a5b44186b2f5038afdc8beda7e5c70aed15b4fbfbcc6e9ece24490f
+          STRACE_VERSION_LINE: strace -- version 7.1
+          GATE_ROOT: ${{ runner.temp }}/jayflow-gate
+        run: |
+          set -euo pipefail
+
+          STRACE_PREFIX="$RUNNER_TEMP/strace-7.1"
+          STRACE_BIN="$STRACE_PREFIX/bin/strace"
+          STRACE_SRC="$(mktemp -d)"
+          trap 'rm -rf "$STRACE_SRC"' EXIT
+
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            -o "$STRACE_SRC/strace-7.1.tar.xz" "$STRACE_URL"
+          printf '%s  %s\n' "$STRACE_SHA256" "$STRACE_SRC/strace-7.1.tar.xz" > "$STRACE_SRC/SHA256SUMS"
+          sha256sum -c --strict "$STRACE_SRC/SHA256SUMS"
+
+          tar -xf "$STRACE_SRC/strace-7.1.tar.xz" -C "$STRACE_SRC"
+          (
+            cd "$STRACE_SRC/strace-7.1"
+            ./configure --prefix="$STRACE_PREFIX" --enable-mpers=no
+            make -j"$(nproc)"
+            make install
+          )
+
+          STRACE_VERSION_OUTPUT="$("$STRACE_BIN" -V)"
+          BUILT_VERSION_LINE="$(printf '%s\n' "$STRACE_VERSION_OUTPUT" | head -1)"
+          if [ "$BUILT_VERSION_LINE" != "$STRACE_VERSION_LINE" ]; then
+            echo "::error::built tracer reports ${BUILT_VERSION_LINE}, want the pinned ${STRACE_VERSION_LINE}"
+            exit 1
+          fi
+          MACHINE="$(uname -m)"
+          if [ "$MACHINE" != x86_64 ]; then
+            echo "::error::the pinned syscall table only covers x86_64, this runner is ${MACHINE}"
+            exit 1
+          fi
+
+          mkdir -p "$GATE_ROOT/tasks"
+          chmod 700 "$GATE_ROOT" "$GATE_ROOT/tasks"
+
+          if ! unshare -U true; then
+            RESTRICTED="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
+            if [ "$RESTRICTED" = 1 ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            fi
+            if ! unshare -U true; then
+              echo "::error::unprivileged CLONE_NEWUSER is unavailable, so the private gates cannot be proven"
+              exit 1
+            fi
+          fi
+
+          printf '%s\n' "$STRACE_PREFIX/bin" >> "$GITHUB_PATH"
+
       - name: Gate 1 - release regression
         working-directory: source
         run: |
@@ -197,12 +252,16 @@ jobs:
 
       - name: Gate 2 - Go tests
         working-directory: source
+        env:
+          JAYFLOW_LOCAL_GATE_ROOT: ${{ runner.temp }}/jayflow-gate
         run: |
           set -euo pipefail
           go test -count=1 ./...
 
       - name: Gate 3 - Go race detector
         working-directory: source
+        env:
+          JAYFLOW_LOCAL_GATE_ROOT: ${{ runner.temp }}/jayflow-gate
         run: |
           set -euo pipefail
           go test -race -count=1 ./...
@@ -594,8 +653,65 @@ jobs:
           go test ./cmd/release-tool
           go build -trimpath -o "$RUNNER_TEMP/jayflow-release-tool" ./cmd/release-tool
 
+      - name: Prepare the private source gate environment
+        env:
+          STRACE_URL: https://github.com/strace/strace/releases/download/v7.1/strace-7.1.tar.xz
+          STRACE_SHA256: 81743ecf2a5b44186b2f5038afdc8beda7e5c70aed15b4fbfbcc6e9ece24490f
+          STRACE_VERSION_LINE: strace -- version 7.1
+          GATE_ROOT: ${{ runner.temp }}/jayflow-gate
+        run: |
+          set -euo pipefail
+
+          STRACE_PREFIX="$RUNNER_TEMP/strace-7.1"
+          STRACE_BIN="$STRACE_PREFIX/bin/strace"
+          STRACE_SRC="$(mktemp -d)"
+          trap 'rm -rf "$STRACE_SRC"' EXIT
+
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            -o "$STRACE_SRC/strace-7.1.tar.xz" "$STRACE_URL"
+          printf '%s  %s\n' "$STRACE_SHA256" "$STRACE_SRC/strace-7.1.tar.xz" > "$STRACE_SRC/SHA256SUMS"
+          sha256sum -c --strict "$STRACE_SRC/SHA256SUMS"
+
+          tar -xf "$STRACE_SRC/strace-7.1.tar.xz" -C "$STRACE_SRC"
+          (
+            cd "$STRACE_SRC/strace-7.1"
+            ./configure --prefix="$STRACE_PREFIX" --enable-mpers=no
+            make -j"$(nproc)"
+            make install
+          )
+
+          STRACE_VERSION_OUTPUT="$("$STRACE_BIN" -V)"
+          BUILT_VERSION_LINE="$(printf '%s\n' "$STRACE_VERSION_OUTPUT" | head -1)"
+          if [ "$BUILT_VERSION_LINE" != "$STRACE_VERSION_LINE" ]; then
+            echo "::error::built tracer reports ${BUILT_VERSION_LINE}, want the pinned ${STRACE_VERSION_LINE}"
+            exit 1
+          fi
+          MACHINE="$(uname -m)"
+          if [ "$MACHINE" != x86_64 ]; then
+            echo "::error::the pinned syscall table only covers x86_64, this runner is ${MACHINE}"
+            exit 1
+          fi
+
+          mkdir -p "$GATE_ROOT/tasks"
+          chmod 700 "$GATE_ROOT" "$GATE_ROOT/tasks"
+
+          if ! unshare -U true; then
+            RESTRICTED="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
+            if [ "$RESTRICTED" = 1 ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            fi
+            if ! unshare -U true; then
+              echo "::error::unprivileged CLONE_NEWUSER is unavailable, so the private gates cannot be proven"
+              exit 1
+            fi
+          fi
+
+          printf '%s\n' "$STRACE_PREFIX/bin" >> "$GITHUB_PATH"
+
       - name: Run focused Linux release gates
         working-directory: source
+        env:
+          JAYFLOW_LOCAL_GATE_ROOT: ${{ runner.temp }}/jayflow-gate
         run: |
           set -euo pipefail
           go test -race ./internal/updater ./internal/webservice ./internal/gateway ./internal/webserver ./cmd/jayflow-web -count=1

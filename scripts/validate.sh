@@ -45,6 +45,7 @@ bash -n "$0"
 
 python3 - "$WORKFLOW" "$ROOT" "$SOURCE_REPO" <<'PY'
 import base64
+import hashlib
 import json
 import os
 import pathlib
@@ -183,6 +184,7 @@ require_order(names(windows_steps), [
     "Validate release inputs",
     "Check out the private source at the validated tag",
     "Derive the reproducible source epoch",
+    "Prepare the private source gate environment",
     "Gate 1 - release regression",
     "Gate 2 - Go tests",
     "Gate 3 - Go race detector",
@@ -205,6 +207,7 @@ require_order(names(linux_steps), [
     "Record and verify source identity",
     "Derive the reproducible source epoch",
     "Build the trusted public auditor",
+    "Prepare the private source gate environment",
     "Run focused Linux release gates",
     "Build and audit reproducible Linux gateway",
     "Upload the unsigned Linux gateway",
@@ -877,6 +880,312 @@ for required in (
 ):
     if required not in linux_gate_script:
         raise SystemExit(f"focused Linux gates are missing {required}")
+
+# ─── the private source gate environment (strace 7.1, gate root, userns) ─────
+#
+# The private gates are fail-closed by design: they require an absolute
+# JAYFLOW_LOCAL_GATE_ROOT holding a tasks/ directory, the exact strace 7.1
+# whose syscall table the spec pinned, x86_64, and a real unprivileged
+# CLONE_NEWUSER. The runner image supplies none of the three, so one identical
+# preparation step must establish all of them before any gate runs, and only
+# the gate steps may receive the resulting environment.
+
+STRACE_URL = "https://github.com/strace/strace/releases/download/v7.1/strace-7.1.tar.xz"
+STRACE_SHA256 = "81743ecf2a5b44186b2f5038afdc8beda7e5c70aed15b4fbfbcc6e9ece24490f"
+STRACE_VERSION_LINE = "strace -- version 7.1"
+GATE_ROOT_EXPRESSION = "${{ runner.temp }}/jayflow-gate"
+PREPARE_STEP_NAME = "Prepare the private source gate environment"
+GATE_STEPS = (
+    ("build_windows", "Gate 2 - Go tests"),
+    ("build_windows", "Gate 3 - Go race detector"),
+    ("build_linux", "Run focused Linux release gates"),
+)
+
+prepare_steps = {}
+for job_name, steps in (("build_windows", windows_steps), ("build_linux", linux_steps)):
+    prepare_steps[job_name] = step_named(steps, PREPARE_STEP_NAME)
+windows_prepare = prepare_steps["build_windows"]
+linux_prepare = prepare_steps["build_linux"]
+if serialized(windows_prepare) != serialized(linux_prepare):
+    raise SystemExit("both build jobs must prepare the gate environment with one identical step")
+prepare_script = windows_prepare["run"]
+if windows_prepare.get("env") != {
+    "STRACE_URL": STRACE_URL,
+    "STRACE_SHA256": STRACE_SHA256,
+    "STRACE_VERSION_LINE": STRACE_VERSION_LINE,
+    "GATE_ROOT": GATE_ROOT_EXPRESSION,
+}:
+    raise SystemExit("the gate preparation step does not pin exactly the audited tarball/version/root")
+if "working-directory" in windows_prepare:
+    raise SystemExit("gate preparation must not run inside the private source checkout")
+
+for required in (
+    # (a) the official tarball by exact URL, checked strictly against its pin.
+    'curl --fail --silent --show-error --location --proto \'=https\' --tlsv1.2 \\',
+    '-o "$STRACE_SRC/strace-7.1.tar.xz" "$STRACE_URL"',
+    'printf \'%s  %s\\n\' "$STRACE_SHA256" "$STRACE_SRC/strace-7.1.tar.xz" > "$STRACE_SRC/SHA256SUMS"',
+    'sha256sum -c --strict "$STRACE_SRC/SHA256SUMS"',
+    # (b) the exact recipe the milestone validated on the reference machine.
+    './configure --prefix="$STRACE_PREFIX" --enable-mpers=no',
+    'make -j"$(nproc)"',
+    "make install",
+    # (c) the literal tracer identity the pinned syscall table covers.
+    'STRACE_PREFIX="$RUNNER_TEMP/strace-7.1"',
+    'STRACE_BIN="$STRACE_PREFIX/bin/strace"',
+    '"$STRACE_BIN" -V',
+    "head -1",
+    'if [ "$BUILT_VERSION_LINE" != "$STRACE_VERSION_LINE" ]; then',
+    'MACHINE="$(uname -m)"',
+    'if [ "$MACHINE" != x86_64 ]; then',
+    # (d) the required gate root and its task directory.
+    'mkdir -p "$GATE_ROOT/tasks"',
+    'chmod 700 "$GATE_ROOT" "$GATE_ROOT/tasks"',
+    # (e) a real unprivileged user namespace, remediated once and then proven.
+    "unshare -U true",
+    "sysctl -n kernel.apparmor_restrict_unprivileged_userns",
+    "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+    # (f) the new tracer reaches the gates through the job PATH only.
+    'printf \'%s\\n\' "$STRACE_PREFIX/bin" >> "$GITHUB_PATH"',
+):
+    if required not in prepare_script:
+        raise SystemExit(f"gate preparation is missing {required}")
+if prepare_script.count(STRACE_VERSION_LINE) != 0:
+    raise SystemExit("the tracer version must be compared against the pinned env value, never a literal copy")
+if "unshare -U true" in prepare_script and prepare_script.count("unshare -U true") != 2:
+    raise SystemExit("gate preparation must prove the user namespace before and after remediation")
+if "|| true" in prepare_script or "continue-on-error" in serialized(windows_prepare):
+    raise SystemExit("gate preparation must stay fail-closed")
+prepare_order = [
+    'sha256sum -c --strict "$STRACE_SRC/SHA256SUMS"',
+    './configure --prefix="$STRACE_PREFIX" --enable-mpers=no',
+    "make install",
+    'if [ "$BUILT_VERSION_LINE" != "$STRACE_VERSION_LINE" ]; then',
+    'if [ "$MACHINE" != x86_64 ]; then',
+    'mkdir -p "$GATE_ROOT/tasks"',
+    "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+    'printf \'%s\\n\' "$STRACE_PREFIX/bin" >> "$GITHUB_PATH"',
+]
+prepare_positions = [prepare_script.index(marker) for marker in prepare_order]
+if prepare_positions != sorted(prepare_positions):
+    raise SystemExit("gate preparation must verify, build, prove, provision, and only then export")
+
+gate_root_steps = []
+for job_name, steps in (
+    ("build_windows", windows_steps),
+    ("build_linux", linux_steps),
+    ("accept_linux", accept_steps),
+    ("sign_publish", sign_steps),
+):
+    for step in steps:
+        if "JAYFLOW_LOCAL_GATE_ROOT" in serialized(step):
+            gate_root_steps.append((job_name, step.get("name")))
+if gate_root_steps != list(GATE_STEPS):
+    raise SystemExit(
+        f"the private gate root is exported to {gate_root_steps}, want exactly {list(GATE_STEPS)}"
+    )
+for job_name, step_name in GATE_STEPS:
+    steps = windows_steps if job_name == "build_windows" else linux_steps
+    gate_step = step_named(steps, step_name)
+    if gate_step.get("env", {}).get("JAYFLOW_LOCAL_GATE_ROOT") != GATE_ROOT_EXPRESSION:
+        raise SystemExit(f"{job_name}/{step_name} does not receive the exact prepared gate root")
+for forbidden in ("JAYFLOW_LOCAL_GATE_ROOT", "jayflow-gate", "strace"):
+    if forbidden in sign_text:
+        raise SystemExit(f"the signing job must never receive the private gate environment: {forbidden}")
+    if forbidden in accept_text:
+        raise SystemExit(f"the transported-byte acceptance job must not carry the gate environment: {forbidden}")
+for job_name, steps in (("build_windows", windows_steps), ("build_linux", linux_steps)):
+    exporters = [
+        step.get("name") for step in steps
+        if "$GITHUB_PATH" in str(step.get("run", "")) and "strace" in str(step.get("run", ""))
+    ]
+    if exporters != [PREPARE_STEP_NAME]:
+        raise SystemExit(f"{job_name} may only put the pinned tracer on PATH from the preparation step")
+
+with tempfile.TemporaryDirectory() as prepare_temp_text:
+    prepare_temp = pathlib.Path(prepare_temp_text)
+    fake_bin = prepare_temp / "fake-bin"
+    fake_bin.mkdir()
+    tarball_payload = b"fixture strace-7.1 tarball bytes\n"
+    tarball_digest = hashlib.sha256(tarball_payload).hexdigest()
+    (prepare_temp / "payload").write_bytes(tarball_payload)
+
+    (fake_bin / "curl").write_text(r'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+with pathlib.Path(os.environ["FAKE_PREPARE_LOG"]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"tool": "curl", "args": args}) + "\n")
+if os.environ.get("FAKE_PREPARE_FAILURE") == "download":
+    raise SystemExit(22)
+destination = pathlib.Path(args[args.index("-o") + 1])
+destination.write_bytes(pathlib.Path(os.environ["FAKE_PREPARE_PAYLOAD"]).read_bytes())
+''', encoding="utf-8")
+
+    (fake_bin / "tar").write_text(r'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+with pathlib.Path(os.environ["FAKE_PREPARE_LOG"]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"tool": "tar", "args": args}) + "\n")
+destination = pathlib.Path(args[args.index("-C") + 1]) / "strace-7.1"
+destination.mkdir(parents=True, exist_ok=True)
+configure = destination / "configure"
+configure.write_text(
+    "#!/usr/bin/env python3\n"
+    "import json, os, pathlib, sys\n"
+    "args = sys.argv[1:]\n"
+    "handle = pathlib.Path(os.environ['FAKE_PREPARE_LOG']).open('a', encoding='utf-8')\n"
+    "handle.write(json.dumps({'tool': 'configure', 'args': args}) + '\\n')\n"
+    "handle.close()\n"
+    "if os.environ.get('FAKE_PREPARE_FAILURE') == 'configure':\n"
+    "    raise SystemExit(1)\n"
+    "prefix = [a.split('=', 1)[1] for a in args if a.startswith('--prefix=')][0]\n"
+    "pathlib.Path(os.environ['FAKE_PREPARE_PREFIX']).write_text(prefix, encoding='utf-8')\n",
+    encoding="utf-8",
+)
+configure.chmod(0o755)
+''', encoding="utf-8")
+
+    (fake_bin / "make").write_text(r'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+with pathlib.Path(os.environ["FAKE_PREPARE_LOG"]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"tool": "make", "args": args}) + "\n")
+if os.environ.get("FAKE_PREPARE_FAILURE") == "make":
+    raise SystemExit(2)
+if args != ["install"]:
+    raise SystemExit(0)
+prefix = pathlib.Path(pathlib.Path(os.environ["FAKE_PREPARE_PREFIX"]).read_text(encoding="utf-8"))
+(prefix / "bin").mkdir(parents=True, exist_ok=True)
+tracer = prefix / "bin" / "strace"
+tracer.write_text(
+    "#!/usr/bin/env bash\n"
+    "printf '%s\\n' \"$FAKE_PREPARE_STRACE_VERSION\"\n"
+    "printf 'Copyright fixture\\nlicense fixture\\nthere is NO warranty\\n'\n",
+    encoding="utf-8",
+)
+tracer.chmod(0o755)
+''', encoding="utf-8")
+
+    (fake_bin / "unshare").write_text(r'''#!/usr/bin/env bash
+printf 'unshare %s\n' "$*" >> "$FAKE_PREPARE_TOOLS"
+[ "$(cat "$FAKE_PREPARE_USERNS")" = ok ] || exit 1
+exit 0
+''', encoding="utf-8")
+
+    (fake_bin / "sysctl").write_text(r'''#!/usr/bin/env bash
+printf 'sysctl %s\n' "$*" >> "$FAKE_PREPARE_TOOLS"
+case "${1:-}" in
+  -n) printf '%s\n' "$FAKE_PREPARE_APPARMOR" ;;
+  -w) [ "${FAKE_PREPARE_USERNS_FIXABLE:-1}" != 1 ] || printf 'ok' > "$FAKE_PREPARE_USERNS" ;;
+  *) exit 64 ;;
+esac
+exit 0
+''', encoding="utf-8")
+
+    (fake_bin / "sudo").write_text(r'''#!/usr/bin/env bash
+printf 'sudo %s\n' "$*" >> "$FAKE_PREPARE_TOOLS"
+exec "$@"
+''', encoding="utf-8")
+
+    (fake_bin / "uname").write_text(r'''#!/usr/bin/env bash
+printf '%s\n' "$FAKE_PREPARE_MACHINE"
+''', encoding="utf-8")
+
+    (fake_bin / "nproc").write_text("#!/usr/bin/env bash\nprintf '2\\n'\n", encoding="utf-8")
+
+    for stub in fake_bin.iterdir():
+        stub.chmod(0o755)
+
+    def run_prepare(scenario, *, failure="", userns="ok", apparmor="0", fixable="1",
+                    machine="x86_64", version=STRACE_VERSION_LINE, sha=None):
+        scenario_root = prepare_temp / scenario
+        scenario_root.mkdir()
+        runner_temp = scenario_root / "runner-temp"
+        runner_temp.mkdir()
+        github_path = scenario_root / "github-path"
+        state = scenario_root / "userns"
+        state.write_text(userns, encoding="utf-8")
+        log = scenario_root / "calls.jsonl"
+        log.touch()
+        tools = scenario_root / "tools.log"
+        tools.touch()
+        env = safe_env.copy()
+        env.update({
+            "PATH": str(fake_bin) + os.pathsep + safe_env["PATH"],
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_PATH": str(github_path),
+            "STRACE_URL": STRACE_URL,
+            "STRACE_SHA256": tarball_digest if sha is None else sha,
+            "STRACE_VERSION_LINE": STRACE_VERSION_LINE,
+            "GATE_ROOT": str(runner_temp / "jayflow-gate"),
+            "FAKE_PREPARE_LOG": str(log),
+            "FAKE_PREPARE_TOOLS": str(tools),
+            "FAKE_PREPARE_PAYLOAD": str(prepare_temp / "payload"),
+            "FAKE_PREPARE_PREFIX": str(scenario_root / "prefix"),
+            "FAKE_PREPARE_USERNS": str(state),
+            "FAKE_PREPARE_USERNS_FIXABLE": fixable,
+            "FAKE_PREPARE_APPARMOR": apparmor,
+            "FAKE_PREPARE_MACHINE": machine,
+            "FAKE_PREPARE_STRACE_VERSION": version,
+            "FAKE_PREPARE_FAILURE": failure,
+        })
+        result = checked(["bash", "-c", prepare_script], cwd=scenario_root, env=env)
+        calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line]
+        return result, calls, tools.read_text(encoding="utf-8"), github_path, runner_temp
+
+    result, calls, tools_log, github_path, runner_temp = run_prepare("clean")
+    require_success(result, "behavioral gate environment preparation")
+    curl_calls = [call for call in calls if call["tool"] == "curl"]
+    if len(curl_calls) != 1 or STRACE_URL not in curl_calls[0]["args"]:
+        raise SystemExit(f"gate preparation must fetch exactly the pinned tarball URL once: {curl_calls}")
+    configure_calls = [call for call in calls if call["tool"] == "configure"]
+    if len(configure_calls) != 1 or configure_calls[0]["args"] != [
+        f"--prefix={runner_temp}/strace-7.1", "--enable-mpers=no"
+    ]:
+        raise SystemExit(f"gate preparation configure arguments are not the audited recipe: {configure_calls}")
+    make_calls = [call["args"] for call in calls if call["tool"] == "make"]
+    if make_calls != [["-j2"], ["install"]]:
+        raise SystemExit(f"gate preparation must build then install the pinned tracer: {make_calls}")
+    gate_root = runner_temp / "jayflow-gate"
+    if not (gate_root / "tasks").is_dir():
+        raise SystemExit("gate preparation did not create the required tasks directory under the gate root")
+    for directory in (gate_root, gate_root / "tasks"):
+        if oct(directory.stat().st_mode & 0o777) != "0o700":
+            raise SystemExit(f"{directory} must be exactly mode 0700")
+    if github_path.read_text(encoding="utf-8") != f"{runner_temp}/strace-7.1/bin\n":
+        raise SystemExit("gate preparation must prepend exactly the built tracer directory to PATH")
+    if "sysctl -w" in tools_log:
+        raise SystemExit("gate preparation relaxed the kernel although the namespace already worked")
+
+    result, calls, tools_log, github_path, runner_temp = run_prepare(
+        "restricted", userns="blocked", apparmor="1"
+    )
+    require_success(result, "behavioral gate preparation under AppArmor userns restriction")
+    if "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" not in tools_log:
+        raise SystemExit("a restricted runner must be remediated with the exact sysctl write")
+    if tools_log.count("unshare -U true") != 2:
+        raise SystemExit("remediation must be re-proven with a second real unshare")
+    if not github_path.exists():
+        raise SystemExit("a remediated runner must still export the prepared environment")
+
+    for scenario, options in (
+        ("sha-mismatch", {"sha": "0" * 64}),
+        ("download-failure", {"failure": "download"}),
+        ("configure-failure", {"failure": "configure"}),
+        ("make-failure", {"failure": "make"}),
+        ("wrong-tracer-version", {"version": "strace -- version 6.8"}),
+        ("wrong-tracer-patch", {"version": "strace -- version 7.1.1"}),
+        ("wrong-machine", {"machine": "aarch64"}),
+        ("userns-unavailable", {"userns": "blocked", "apparmor": "0"}),
+        ("userns-unfixable", {"userns": "blocked", "apparmor": "1", "fixable": "0"}),
+    ):
+        result, calls, tools_log, github_path, runner_temp = run_prepare(scenario, **options)
+        if result.returncode == 0:
+            raise SystemExit(f"gate preparation accepted injected failure {scenario}")
+        if github_path.exists():
+            raise SystemExit(f"gate preparation exported the environment despite failure {scenario}")
+        if scenario == "sha-mismatch" and any(call["tool"] in {"configure", "make"} for call in calls):
+            raise SystemExit("an unverified tarball must never be configured or built")
+
 
 linux_build_step = step_named(linux_steps, "Build and audit reproducible Linux gateway")
 if linux_build_step.get("working-directory") != "source" or linux_build_step.get("env") != {
