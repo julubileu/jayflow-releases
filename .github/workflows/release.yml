@@ -1114,11 +1114,20 @@ jobs:
         env:
           VERSION: ${{ needs.build_linux.outputs.version }}
           SOURCE_SHA: ${{ needs.build_linux.outputs.source_sha }}
+          # The harness refuses to create a user, enable linger or start a unit
+          # without both opt-ins: without the first it prints SKIP and exits 0,
+          # without the second it refuses outright. Neither path prints a gate
+          # line, so the acceptance would be vacuous rather than green.
+          JAYFLOW_SYSTEMD_TEST: '1'
+          JAYFLOW_DISPOSABLE_CONFIRM: 'YES'
         run: |
           set -euo pipefail
           ACCEPTANCE_LOG="$RUNNER_TEMP/mobile-release-acceptance.log"
-          sudo --preserve-env=JAYFLOW_CHROMIUM \
-            source/tests/mobile-release-systemd.sh \
+          # The harness is checked out 100644, so it is started through bash;
+          # and sudo resets the environment, so the browser and both opt-ins are
+          # carried across the elevation by name.
+          sudo --preserve-env=JAYFLOW_CHROMIUM,JAYFLOW_SYSTEMD_TEST,JAYFLOW_DISPOSABLE_CONFIRM \
+            bash source/tests/mobile-release-systemd.sh \
             --gateway "$PWD/candidate/jayflow-web-${VERSION}-linux-amd64" \
             --daemon "$RUNNER_TEMP/jayflowd-acceptance" \
             --version "$VERSION" \

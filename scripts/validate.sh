@@ -1766,14 +1766,33 @@ for forbidden in ("playwright install", "npx playwright", "npm install"):
         raise SystemExit(f"accept_linux must not download a browser or use unpinned install: {forbidden}")
 
 acceptance_step = step_named(accept_steps, "Run real-systemd and Playwright acceptance")
+# The harness refuses to touch anything without both opt-ins: without
+# JAYFLOW_SYSTEMD_TEST=1 it prints SKIP and exits 0, and without
+# JAYFLOW_DISPOSABLE_CONFIRM=YES it exits 2. Either way it never emits a gate
+# line, so the opt-ins belong to the step's identity exactly like the version.
 if acceptance_step.get("env") != {
     "VERSION": "${{ needs.build_linux.outputs.version }}",
     "SOURCE_SHA": "${{ needs.build_linux.outputs.source_sha }}",
+    "JAYFLOW_SYSTEMD_TEST": "1",
+    "JAYFLOW_DISPOSABLE_CONFIRM": "YES",
 }:
-    raise SystemExit("acceptance harness identity is not bound to build_linux")
+    raise SystemExit("acceptance harness identity/opt-ins are not bound to build_linux")
 acceptance_script = acceptance_step["run"]
-exact_acceptance = '''sudo --preserve-env=JAYFLOW_CHROMIUM \\
-  source/tests/mobile-release-systemd.sh \\
+# The harness is checked out 100644 — it is data, not an executable — so it can
+# only be started through an explicit interpreter. Naming the path on its own
+# is the defect this pins shut: sudo answers `command not found`.
+ACCEPTANCE_HARNESS = "source/tests/mobile-release-systemd.sh"
+if acceptance_script.count(ACCEPTANCE_HARNESS) != 1:
+    raise SystemExit("accept_linux must name the systemd harness exactly once")
+if f"bash {ACCEPTANCE_HARNESS}" not in acceptance_script:
+    raise SystemExit(
+        "accept_linux must run the systemd harness through bash, never as a bare path"
+    )
+# `sudo` resets the environment, so every variable the harness reads has to be
+# carried across the elevation by name: the browser it drives and both opt-ins.
+ACCEPTANCE_PRESERVED = ("JAYFLOW_CHROMIUM", "JAYFLOW_SYSTEMD_TEST", "JAYFLOW_DISPOSABLE_CONFIRM")
+exact_acceptance = '''sudo --preserve-env=JAYFLOW_CHROMIUM,JAYFLOW_SYSTEMD_TEST,JAYFLOW_DISPOSABLE_CONFIRM \\
+  bash source/tests/mobile-release-systemd.sh \\
   --gateway "$PWD/candidate/jayflow-web-${VERSION}-linux-amd64" \\
   --daemon "$RUNNER_TEMP/jayflowd-acceptance" \\
   --version "$VERSION" \\
@@ -1781,6 +1800,20 @@ exact_acceptance = '''sudo --preserve-env=JAYFLOW_CHROMIUM \\
   --playwright "$PWD/source/cmd/jayflow/frontend/scripts/mobile-release.playwright.mjs"'''
 if exact_acceptance not in acceptance_script:
     raise SystemExit("accept_linux does not invoke the exact transported-byte systemd harness")
+preserve_flags = re.findall(r"--preserve-env=(\S+)", acceptance_script)
+if len(preserve_flags) != 1:
+    raise SystemExit("accept_linux must elevate the harness exactly once, with one --preserve-env")
+preserved_names = preserve_flags[0].split(",")
+if preserved_names != list(ACCEPTANCE_PRESERVED):
+    raise SystemExit(
+        f"accept_linux preserves {preserved_names} across sudo, want {list(ACCEPTANCE_PRESERVED)}"
+    )
+# The harness reports through the pipe, so without pipefail a harness that dies
+# would be laundered into the exit status of `tee`.
+if "set -euo pipefail" not in acceptance_script:
+    raise SystemExit("accept_linux must run the acceptance under set -euo pipefail")
+if "| tee " not in acceptance_script:
+    raise SystemExit("accept_linux must keep the acceptance transcript for the gate scan")
 acceptance_passes = [
     "playwright: 390x844 layout PASS",
     "playwright: secure session and headers PASS",
@@ -1794,6 +1827,13 @@ acceptance_passes = [
 for gate in acceptance_passes:
     if gate not in acceptance_script:
         raise SystemExit(f"accept_linux does not require successful gate output: {gate}")
+# All eight, in the planned order, and nothing else: a shortened list is a
+# silently weakened acceptance.
+exact_required_gates = "REQUIRED_GATES=(\n" + "".join(
+    f'  "{gate}"\n' for gate in acceptance_passes
+) + ")"
+if exact_required_gates not in acceptance_script:
+    raise SystemExit("accept_linux REQUIRED_GATES is not exactly the eight planned gate lines")
 
 with tempfile.TemporaryDirectory() as accept_temp_text:
     accept_temp = pathlib.Path(accept_temp_text)
@@ -1817,6 +1857,17 @@ exit 0
     harness.write_text(r'''#!/usr/bin/env bash
 set -euo pipefail
 printf 'harness %s\n' "$*" >> "$FAKE_ACCEPT_TOOL_LOG"
+# Same two opt-in guards as the real harness, with the same outcomes: no
+# JAYFLOW_SYSTEMD_TEST is a silent SKIP that exits 0, and no
+# JAYFLOW_DISPOSABLE_CONFIRM is a refusal. Neither prints a gate line.
+if [ "${JAYFLOW_SYSTEMD_TEST:-}" != "1" ]; then
+  printf '%s\n' 'SKIP: set JAYFLOW_SYSTEMD_TEST=1 on a disposable Linux/amd64 user-systemd VM'
+  exit 0
+fi
+if [ "${JAYFLOW_DISPOSABLE_CONFIRM:-}" != "YES" ]; then
+  printf '%s\n' 'FAIL: set JAYFLOW_DISPOSABLE_CONFIRM=YES only on the disposable target' >&2
+  exit 2
+fi
 systemctl --user start jayflow-web.service
 loginctl enable-linger fixture
 runuser -u fixture -- true
@@ -1825,6 +1876,7 @@ userdel fixture
 "$JAYFLOW_CHROMIUM" --version
 case "${FAKE_ACCEPT_FAILURE:-}" in
   "") ;;
+  late-exit) ;;
   *PASS) ;;
   *) exit 42 ;;
 esac
@@ -1839,13 +1891,29 @@ for GATE in \
   'mobile-release systemd: PASS'; do
   [ "$GATE" = "${FAKE_ACCEPT_FAILURE:-}" ] || printf '%s\n' "$GATE"
 done
+# Every gate printed and then a hard failure: only pipefail can see this one,
+# because `tee` succeeded.
+[ "${FAKE_ACCEPT_FAILURE:-}" != late-exit ] || exit 42
 ''', encoding="utf-8")
-    harness.chmod(0o755)
+    # 100644, exactly as `git ls-tree` reports it in the private source, so a
+    # bare-path invocation cannot succeed here either.
+    harness.chmod(0o644)
     fake_sudo = fake_bin / "sudo"
     fake_sudo.write_text(r'''#!/usr/bin/env bash
 printf 'sudo %s\n' "$*" >> "$FAKE_ACCEPT_TOOL_LOG"
-[ "${1:-}" = --preserve-env=JAYFLOW_CHROMIUM ] || exit 64
+case "${1:-}" in
+  --preserve-env=*) PRESERVED=",${1#--preserve-env=}," ;;
+  *) exit 64 ;;
+esac
 shift
+# Real sudo resets the environment: anything the caller did not list by name is
+# simply not there on the other side of the elevation.
+for NAME in JAYFLOW_CHROMIUM JAYFLOW_SYSTEMD_TEST JAYFLOW_DISPOSABLE_CONFIRM; do
+  case "$PRESERVED" in
+    *",$NAME,"*) ;;
+    *) unset "$NAME" ;;
+  esac
+done
 exec "$@"
 ''', encoding="utf-8")
     fake_sudo.chmod(0o755)
@@ -1857,6 +1925,8 @@ exec "$@"
         "PUBLIC_KEY": "dGVzdC1wdWJsaWMta2V5",
         "RUNNER_TEMP": str(accept_temp / "runner"),
         "JAYFLOW_CHROMIUM": str(fake_bin / "chromium"),
+        "JAYFLOW_SYSTEMD_TEST": acceptance_step["env"]["JAYFLOW_SYSTEMD_TEST"],
+        "JAYFLOW_DISPOSABLE_CONFIRM": acceptance_step["env"]["JAYFLOW_DISPOSABLE_CONFIRM"],
         "FAKE_ACCEPT_TOOL_LOG": str(accept_log),
     })
     pathlib.Path(accept_env["RUNNER_TEMP"]).mkdir()
@@ -1881,7 +1951,7 @@ exit 0
         if required not in observed_tools:
             raise SystemExit(f"acceptance simulator did not exercise stub {required.strip()}")
     for failure in (
-        "service start", "health",
+        "service start", "health", "late-exit",
         "playwright: 390x844 layout PASS",
         "playwright: secure session and headers PASS",
         "playwright: websocket origin/token/limit PASS",
