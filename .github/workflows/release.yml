@@ -194,7 +194,10 @@ jobs:
           STRACE_URL: https://github.com/strace/strace/releases/download/v7.1/strace-7.1.tar.xz
           STRACE_SHA256: 81743ecf2a5b44186b2f5038afdc8beda7e5c70aed15b4fbfbcc6e9ece24490f
           STRACE_VERSION_LINE: strace -- version 7.1
-          GATE_ROOT: ${{ runner.temp }}/jayflow-gate
+          GATE_TMPFS: /dev/shm
+          GATE_TMPFS_MIN_BYTES: "2147483648"
+          GATE_ROOT: /dev/shm/jayflow-gate
+          GATE_TMPDIR: /dev/shm/jayflow-tmp
         run: |
           set -euo pipefail
 
@@ -228,8 +231,45 @@ jobs:
             exit 1
           fi
 
+          # The private gates were designed against a scratch on tmpfs and
+          # outside the real home. The runner satisfies neither by default:
+          # RUNNER_TEMP is /home/runner/work/_temp, which the gates refuse as
+          # part of the real home, and the ext4 behind it recycles an inode
+          # number the instant it is freed, so a listener or a path the gates
+          # had just probed comes back wearing the same identity. /dev/shm is
+          # the runner's tmpfs: it is outside /home and it draws inode numbers
+          # from a monotonic counter, which is exactly the reference machine.
+          GATE_FS_TYPE="$(stat -f -c %T "$GATE_TMPFS")"
+          if [ "$GATE_FS_TYPE" != tmpfs ]; then
+            echo "::error::${GATE_TMPFS} is ${GATE_FS_TYPE}, want tmpfs so the gates never observe a recycled inode number"
+            exit 1
+          fi
+          GATE_TMPFS_FREE="$(df --output=avail -B1 "$GATE_TMPFS" | tail -1 | tr -d ' ')"
+          if [ "$GATE_TMPFS_FREE" -lt "$GATE_TMPFS_MIN_BYTES" ]; then
+            echo "::error::${GATE_TMPFS} has ${GATE_TMPFS_FREE} free bytes, want at least ${GATE_TMPFS_MIN_BYTES} for the gate scratch"
+            exit 1
+          fi
+
+          # The forbidden prefix is the account's registered home, which is what
+          # the gates read from the account database, plus the two runner
+          # directories that live inside it.
+          REAL_HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
+          for reserved in "$REAL_HOME" "$RUNNER_TEMP" "${GITHUB_WORKSPACE:-}"; do
+            [ -n "$reserved" ] || continue
+            for provisioned in "$GATE_ROOT" "$GATE_TMPDIR"; do
+              case "$provisioned/" in
+                "$reserved"/*)
+                  echo "::error::${provisioned} lies inside ${reserved}, which the private gates refuse"
+                  exit 1
+                  ;;
+              esac
+            done
+          done
+
+          rm -rf "$GATE_ROOT" "$GATE_TMPDIR"
+          mkdir -m 700 -p "$GATE_ROOT" "$GATE_TMPDIR"
           mkdir -p "$GATE_ROOT/tasks"
-          chmod 700 "$GATE_ROOT" "$GATE_ROOT/tasks"
+          chmod 700 "$GATE_ROOT" "$GATE_ROOT/tasks" "$GATE_TMPDIR"
 
           if ! unshare -U true; then
             RESTRICTED="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
@@ -253,7 +293,8 @@ jobs:
       - name: Gate 2 - Go tests
         working-directory: source
         env:
-          JAYFLOW_LOCAL_GATE_ROOT: ${{ runner.temp }}/jayflow-gate
+          JAYFLOW_LOCAL_GATE_ROOT: /dev/shm/jayflow-gate
+          TMPDIR: /dev/shm/jayflow-tmp
         run: |
           set -euo pipefail
           go test -count=1 ./...
@@ -261,7 +302,8 @@ jobs:
       - name: Gate 3 - Go race detector
         working-directory: source
         env:
-          JAYFLOW_LOCAL_GATE_ROOT: ${{ runner.temp }}/jayflow-gate
+          JAYFLOW_LOCAL_GATE_ROOT: /dev/shm/jayflow-gate
+          TMPDIR: /dev/shm/jayflow-tmp
         run: |
           set -euo pipefail
           go test -race -count=1 ./...
@@ -546,6 +588,17 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+      - name: Release the private gate tmpfs
+        if: always()
+        env:
+          GATE_ROOT: /dev/shm/jayflow-gate
+          GATE_TMPDIR: /dev/shm/jayflow-tmp
+        run: |
+          set -euo pipefail
+          # The gate scratch is RAM. Give it back even when a gate failed, so a
+          # re-run on the same host never starts against an occupied tmpfs.
+          rm -rf "$GATE_ROOT" "$GATE_TMPDIR"
+
   build_linux:
     name: Validate and build Linux without the signing key
     runs-on: ubuntu-24.04
@@ -658,7 +711,10 @@ jobs:
           STRACE_URL: https://github.com/strace/strace/releases/download/v7.1/strace-7.1.tar.xz
           STRACE_SHA256: 81743ecf2a5b44186b2f5038afdc8beda7e5c70aed15b4fbfbcc6e9ece24490f
           STRACE_VERSION_LINE: strace -- version 7.1
-          GATE_ROOT: ${{ runner.temp }}/jayflow-gate
+          GATE_TMPFS: /dev/shm
+          GATE_TMPFS_MIN_BYTES: "2147483648"
+          GATE_ROOT: /dev/shm/jayflow-gate
+          GATE_TMPDIR: /dev/shm/jayflow-tmp
         run: |
           set -euo pipefail
 
@@ -692,8 +748,45 @@ jobs:
             exit 1
           fi
 
+          # The private gates were designed against a scratch on tmpfs and
+          # outside the real home. The runner satisfies neither by default:
+          # RUNNER_TEMP is /home/runner/work/_temp, which the gates refuse as
+          # part of the real home, and the ext4 behind it recycles an inode
+          # number the instant it is freed, so a listener or a path the gates
+          # had just probed comes back wearing the same identity. /dev/shm is
+          # the runner's tmpfs: it is outside /home and it draws inode numbers
+          # from a monotonic counter, which is exactly the reference machine.
+          GATE_FS_TYPE="$(stat -f -c %T "$GATE_TMPFS")"
+          if [ "$GATE_FS_TYPE" != tmpfs ]; then
+            echo "::error::${GATE_TMPFS} is ${GATE_FS_TYPE}, want tmpfs so the gates never observe a recycled inode number"
+            exit 1
+          fi
+          GATE_TMPFS_FREE="$(df --output=avail -B1 "$GATE_TMPFS" | tail -1 | tr -d ' ')"
+          if [ "$GATE_TMPFS_FREE" -lt "$GATE_TMPFS_MIN_BYTES" ]; then
+            echo "::error::${GATE_TMPFS} has ${GATE_TMPFS_FREE} free bytes, want at least ${GATE_TMPFS_MIN_BYTES} for the gate scratch"
+            exit 1
+          fi
+
+          # The forbidden prefix is the account's registered home, which is what
+          # the gates read from the account database, plus the two runner
+          # directories that live inside it.
+          REAL_HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
+          for reserved in "$REAL_HOME" "$RUNNER_TEMP" "${GITHUB_WORKSPACE:-}"; do
+            [ -n "$reserved" ] || continue
+            for provisioned in "$GATE_ROOT" "$GATE_TMPDIR"; do
+              case "$provisioned/" in
+                "$reserved"/*)
+                  echo "::error::${provisioned} lies inside ${reserved}, which the private gates refuse"
+                  exit 1
+                  ;;
+              esac
+            done
+          done
+
+          rm -rf "$GATE_ROOT" "$GATE_TMPDIR"
+          mkdir -m 700 -p "$GATE_ROOT" "$GATE_TMPDIR"
           mkdir -p "$GATE_ROOT/tasks"
-          chmod 700 "$GATE_ROOT" "$GATE_ROOT/tasks"
+          chmod 700 "$GATE_ROOT" "$GATE_ROOT/tasks" "$GATE_TMPDIR"
 
           if ! unshare -U true; then
             RESTRICTED="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
@@ -711,7 +804,8 @@ jobs:
       - name: Run focused Linux release gates
         working-directory: source
         env:
-          JAYFLOW_LOCAL_GATE_ROOT: ${{ runner.temp }}/jayflow-gate
+          JAYFLOW_LOCAL_GATE_ROOT: /dev/shm/jayflow-gate
+          TMPDIR: /dev/shm/jayflow-tmp
         run: |
           set -euo pipefail
           go test -race ./internal/updater ./internal/webservice ./internal/gateway ./internal/webserver ./cmd/jayflow-web -count=1
@@ -790,6 +884,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
+
+      - name: Release the private gate tmpfs
+        if: always()
+        env:
+          GATE_ROOT: /dev/shm/jayflow-gate
+          GATE_TMPDIR: /dev/shm/jayflow-tmp
+        run: |
+          set -euo pipefail
+          # The gate scratch is RAM. Give it back even when a gate failed, so a
+          # re-run on the same host never starts against an occupied tmpfs.
+          rm -rf "$GATE_ROOT" "$GATE_TMPDIR"
 
   accept_linux:
     name: Accept transported Linux bytes under real systemd and Playwright

@@ -49,6 +49,7 @@ import hashlib
 import json
 import os
 import pathlib
+import pwd
 import re
 import shutil
 import subprocess
@@ -200,6 +201,7 @@ require_order(names(windows_steps), [
     "Stage and audit the exact unsigned release assets",
     "Upload the unsigned Windows internal artifact",
     "Upload the separately audited daemon artifact",
+    "Release the private gate tmpfs",
 ], "build_windows")
 require_order(names(linux_steps), [
     "Validate release inputs",
@@ -211,6 +213,7 @@ require_order(names(linux_steps), [
     "Run focused Linux release gates",
     "Build and audit reproducible Linux gateway",
     "Upload the unsigned Linux gateway",
+    "Release the private gate tmpfs",
 ], "build_linux")
 require_order(names(accept_steps), [
     "Check out the private source from the Linux build",
@@ -893,8 +896,28 @@ for required in (
 STRACE_URL = "https://github.com/strace/strace/releases/download/v7.1/strace-7.1.tar.xz"
 STRACE_SHA256 = "81743ecf2a5b44186b2f5038afdc8beda7e5c70aed15b4fbfbcc6e9ece24490f"
 STRACE_VERSION_LINE = "strace -- version 7.1"
-GATE_ROOT_EXPRESSION = "${{ runner.temp }}/jayflow-gate"
+# The gate root and the gates' TMPDIR both live on the runner's tmpfs, outside
+# the real home. Two measured classes of failure force it:
+#   (A) the gates refuse a gate root or a validated scratch inside the account's
+#       real home, and RUNNER_TEMP is /home/runner/work/_temp on the runner;
+#   (B) the ext4 backing the runner's /tmp recycles inode numbers immediately,
+#       so the identity races observe a replacement wearing the identity they
+#       had just probed. tmpfs draws inode numbers from a monotonic counter,
+#       which is the reference machine's behaviour these gates were designed
+#       against.
+# /dev/shm is tmpfs on the runner image, is outside /home, and needs no
+# elevation to use.
+GATE_TMPFS = "/dev/shm"
+GATE_ROOT_EXPRESSION = "/dev/shm/jayflow-gate"
+GATE_TMPDIR_EXPRESSION = "/dev/shm/jayflow-tmp"
+# 2 GiB. One focused gate run holds the Go build work directories, the traced
+# gateway instances and the SQLite scratch under TMPDIR at the same time, and a
+# tmpfs is charged against the runner's RAM. Below that floor the run dies of
+# ENOSPC inside a gate, which is indistinguishable from a real gate failure;
+# refusing here names what actually happened.
+GATE_TMPFS_MIN_BYTES = "2147483648"
 PREPARE_STEP_NAME = "Prepare the private source gate environment"
+CLEANUP_STEP_NAME = "Release the private gate tmpfs"
 GATE_STEPS = (
     ("build_windows", "Gate 2 - Go tests"),
     ("build_windows", "Gate 3 - Go race detector"),
@@ -913,9 +936,15 @@ if windows_prepare.get("env") != {
     "STRACE_URL": STRACE_URL,
     "STRACE_SHA256": STRACE_SHA256,
     "STRACE_VERSION_LINE": STRACE_VERSION_LINE,
+    "GATE_TMPFS": GATE_TMPFS,
+    "GATE_TMPFS_MIN_BYTES": GATE_TMPFS_MIN_BYTES,
     "GATE_ROOT": GATE_ROOT_EXPRESSION,
+    "GATE_TMPDIR": GATE_TMPDIR_EXPRESSION,
 }:
-    raise SystemExit("the gate preparation step does not pin exactly the audited tarball/version/root")
+    raise SystemExit(
+        "the gate preparation step does not pin exactly the audited tarball/version, "
+        "the tmpfs and its floor, the gate root and the gates' TMPDIR"
+    )
 if "working-directory" in windows_prepare:
     raise SystemExit("gate preparation must not run inside the private source checkout")
 
@@ -937,14 +966,26 @@ for required in (
     'if [ "$BUILT_VERSION_LINE" != "$STRACE_VERSION_LINE" ]; then',
     'MACHINE="$(uname -m)"',
     'if [ "$MACHINE" != x86_64 ]; then',
-    # (d) the required gate root and its task directory.
+    # (d) the tmpfs itself: it is measured, not assumed, and it must have room.
+    'GATE_FS_TYPE="$(stat -f -c %T "$GATE_TMPFS")"',
+    'if [ "$GATE_FS_TYPE" != tmpfs ]; then',
+    'GATE_TMPFS_FREE="$(df --output=avail -B1 "$GATE_TMPFS" | tail -1 | tr -d \' \')"',
+    'if [ "$GATE_TMPFS_FREE" -lt "$GATE_TMPFS_MIN_BYTES" ]; then',
+    # (e) neither provisioned path may land in a directory the gates refuse.
+    'REAL_HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"',
+    'for reserved in "$REAL_HOME" "$RUNNER_TEMP" "${GITHUB_WORKSPACE:-}"; do',
+    'for provisioned in "$GATE_ROOT" "$GATE_TMPDIR"; do',
+    '"$reserved"/*)',
+    # (f) the required gate root, its task directory, and the gates' own TMPDIR.
+    'rm -rf "$GATE_ROOT" "$GATE_TMPDIR"',
+    'mkdir -m 700 -p "$GATE_ROOT" "$GATE_TMPDIR"',
     'mkdir -p "$GATE_ROOT/tasks"',
     'chmod 700 "$GATE_ROOT" "$GATE_ROOT/tasks"',
-    # (e) a real unprivileged user namespace, remediated once and then proven.
+    # (g) a real unprivileged user namespace, remediated once and then proven.
     "unshare -U true",
     "sysctl -n kernel.apparmor_restrict_unprivileged_userns",
     "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
-    # (f) the new tracer reaches the gates through the job PATH only.
+    # (h) the new tracer reaches the gates through the job PATH only.
     'printf \'%s\\n\' "$STRACE_PREFIX/bin" >> "$GITHUB_PATH"',
 ):
     if required not in prepare_script:
@@ -961,6 +1002,10 @@ prepare_order = [
     "make install",
     'if [ "$BUILT_VERSION_LINE" != "$STRACE_VERSION_LINE" ]; then',
     'if [ "$MACHINE" != x86_64 ]; then',
+    'GATE_FS_TYPE="$(stat -f -c %T "$GATE_TMPFS")"',
+    'if [ "$GATE_TMPFS_FREE" -lt "$GATE_TMPFS_MIN_BYTES" ]; then',
+    'REAL_HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"',
+    'mkdir -m 700 -p "$GATE_ROOT" "$GATE_TMPDIR"',
     'mkdir -p "$GATE_ROOT/tasks"',
     "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
     'printf \'%s\\n\' "$STRACE_PREFIX/bin" >> "$GITHUB_PATH"',
@@ -968,6 +1013,25 @@ prepare_order = [
 prepare_positions = [prepare_script.index(marker) for marker in prepare_order]
 if prepare_positions != sorted(prepare_positions):
     raise SystemExit("gate preparation must verify, build, prove, provision, and only then export")
+
+# Both provisioned paths must be literal tmpfs paths. An expression that
+# resolved back to the runner temp, the home or the workspace would reinstate
+# exactly the two measured failure classes, so the workflow may not name one.
+for label, expression in (
+    ("gate root", GATE_ROOT_EXPRESSION),
+    ("gate TMPDIR", GATE_TMPDIR_EXPRESSION),
+):
+    if not expression.startswith(GATE_TMPFS + "/") or expression.count("/") != GATE_TMPFS.count("/") + 1:
+        raise SystemExit(f"the {label} must be a direct child of {GATE_TMPFS}")
+for forbidden in (
+    "${{ runner.temp }}/jayflow-gate",
+    "$RUNNER_TEMP/jayflow-gate",
+    "${{ runner.temp }}/jayflow-tmp",
+    "$RUNNER_TEMP/jayflow-tmp",
+    "${{ github.workspace }}/jayflow-gate",
+):
+    if forbidden in workflow_text:
+        raise SystemExit(f"the gate environment must never be provisioned at {forbidden}")
 
 gate_root_steps = []
 for job_name, steps in (
@@ -986,9 +1050,79 @@ if gate_root_steps != list(GATE_STEPS):
 for job_name, step_name in GATE_STEPS:
     steps = windows_steps if job_name == "build_windows" else linux_steps
     gate_step = step_named(steps, step_name)
-    if gate_step.get("env", {}).get("JAYFLOW_LOCAL_GATE_ROOT") != GATE_ROOT_EXPRESSION:
-        raise SystemExit(f"{job_name}/{step_name} does not receive the exact prepared gate root")
-for forbidden in ("JAYFLOW_LOCAL_GATE_ROOT", "jayflow-gate", "strace"):
+    if gate_step.get("env") != {
+        "JAYFLOW_LOCAL_GATE_ROOT": GATE_ROOT_EXPRESSION,
+        "TMPDIR": GATE_TMPDIR_EXPRESSION,
+    }:
+        raise SystemExit(
+            f"{job_name}/{step_name} must receive exactly the prepared gate root and the "
+            "dedicated tmpfs TMPDIR"
+        )
+
+# The dedicated TMPDIR is what moves t.TempDir() off the inode-recycling ext4,
+# so it has the same blast radius as the gate root: exactly the three gate
+# steps, and nothing else in any job.
+tmpdir_steps = []
+shm_steps = []
+for job_name, steps in (
+    ("build_windows", windows_steps),
+    ("build_linux", linux_steps),
+    ("accept_linux", accept_steps),
+    ("sign_publish", sign_steps),
+):
+    for step in steps:
+        if "TMPDIR" in step.get("env", {}):
+            tmpdir_steps.append((job_name, step.get("name")))
+        if GATE_TMPFS in serialized(step):
+            shm_steps.append((job_name, step.get("name")))
+if tmpdir_steps != list(GATE_STEPS):
+    raise SystemExit(
+        f"the gates' TMPDIR is exported to {tmpdir_steps}, want exactly {list(GATE_STEPS)}"
+    )
+expected_shm_steps = sorted([
+    ("build_windows", PREPARE_STEP_NAME),
+    ("build_windows", CLEANUP_STEP_NAME),
+    ("build_linux", PREPARE_STEP_NAME),
+    ("build_linux", CLEANUP_STEP_NAME),
+] + list(GATE_STEPS))
+if sorted(shm_steps) != expected_shm_steps:
+    raise SystemExit(
+        f"{GATE_TMPFS} is named by {sorted(shm_steps)}, want exactly {expected_shm_steps}"
+    )
+
+# Whatever the preparation put on the tmpfs is charged against the runner's RAM
+# until the job ends, so each build job releases it unconditionally, including
+# after a failed gate.
+cleanups = {}
+for job_name, steps in (("build_windows", windows_steps), ("build_linux", linux_steps)):
+    cleanup = step_named(steps, CLEANUP_STEP_NAME)
+    cleanups[job_name] = cleanup
+    if steps[-1] is not cleanup:
+        raise SystemExit(f"{job_name} must release the gate tmpfs as its last step")
+    if cleanup.get("if") != "always()":
+        raise SystemExit(f"{job_name} tmpfs cleanup must run with if: always()")
+    if cleanup.get("env") != {
+        "GATE_ROOT": GATE_ROOT_EXPRESSION,
+        "GATE_TMPDIR": GATE_TMPDIR_EXPRESSION,
+    }:
+        raise SystemExit(f"{job_name} tmpfs cleanup must name exactly the two provisioned paths")
+    if "working-directory" in cleanup:
+        raise SystemExit(f"{job_name} tmpfs cleanup must not run inside the private source checkout")
+    for required in ("set -euo pipefail", 'rm -rf "$GATE_ROOT" "$GATE_TMPDIR"'):
+        if required not in cleanup["run"]:
+            raise SystemExit(f"{job_name} tmpfs cleanup is missing {required}")
+if serialized(cleanups["build_windows"]) != serialized(cleanups["build_linux"]):
+    raise SystemExit("both build jobs must release the gate tmpfs with one identical step")
+cleanup_script = cleanups["build_windows"]["run"]
+
+for forbidden in (
+    "JAYFLOW_LOCAL_GATE_ROOT",
+    "jayflow-gate",
+    "jayflow-tmp",
+    "strace",
+    "TMPDIR",
+    GATE_TMPFS,
+):
     if forbidden in sign_text:
         raise SystemExit(f"the signing job must never receive the private gate environment: {forbidden}")
     if forbidden in accept_text:
@@ -1092,15 +1226,42 @@ printf '%s\n' "$FAKE_PREPARE_MACHINE"
 
     (fake_bin / "nproc").write_text("#!/usr/bin/env bash\nprintf '2\\n'\n", encoding="utf-8")
 
+    # stat -f and df answer for the fixture tmpfs; every other stat call is the
+    # real one, so the mode and ownership assertions stay honest.
+    (fake_bin / "stat").write_text(r'''#!/usr/bin/env bash
+if [ "${1:-}" = -f ]; then
+  printf '%s\n' "$FAKE_PREPARE_FSTYPE"
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+''', encoding="utf-8")
+
+    (fake_bin / "df").write_text(r'''#!/usr/bin/env bash
+printf 'Avail\n%s\n' "$FAKE_PREPARE_FREE"
+''', encoding="utf-8")
+
     for stub in fake_bin.iterdir():
         stub.chmod(0o755)
 
+    real_home = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
+
     def run_prepare(scenario, *, failure="", userns="ok", apparmor="0", fixable="1",
-                    machine="x86_64", version=STRACE_VERSION_LINE, sha=None):
+                    machine="x86_64", version=STRACE_VERSION_LINE, sha=None,
+                    fstype="tmpfs", free="8589934592", gate_root=None, gate_tmpdir=None):
         scenario_root = prepare_temp / scenario
         scenario_root.mkdir()
         runner_temp = scenario_root / "runner-temp"
         runner_temp.mkdir()
+        shm = scenario_root / "shm"
+        shm.mkdir()
+        workspace = scenario_root / "workspace"
+
+        def resolved(candidate, default):
+            if candidate is None:
+                return str(default)
+            return candidate.replace("@RUNNER_TEMP@", str(runner_temp)).replace(
+                "@WORKSPACE@", str(workspace)
+            )
         github_path = scenario_root / "github-path"
         state = scenario_root / "userns"
         state.write_text(userns, encoding="utf-8")
@@ -1116,7 +1277,13 @@ printf '%s\n' "$FAKE_PREPARE_MACHINE"
             "STRACE_URL": STRACE_URL,
             "STRACE_SHA256": tarball_digest if sha is None else sha,
             "STRACE_VERSION_LINE": STRACE_VERSION_LINE,
-            "GATE_ROOT": str(runner_temp / "jayflow-gate"),
+            "GATE_TMPFS": str(shm),
+            "GATE_TMPFS_MIN_BYTES": GATE_TMPFS_MIN_BYTES,
+            "GATE_ROOT": resolved(gate_root, shm / "jayflow-gate"),
+            "GATE_TMPDIR": resolved(gate_tmpdir, shm / "jayflow-tmp"),
+            "GITHUB_WORKSPACE": str(workspace),
+            "FAKE_PREPARE_FSTYPE": fstype,
+            "FAKE_PREPARE_FREE": free,
             "FAKE_PREPARE_LOG": str(log),
             "FAKE_PREPARE_TOOLS": str(tools),
             "FAKE_PREPARE_PAYLOAD": str(prepare_temp / "payload"),
@@ -1130,9 +1297,9 @@ printf '%s\n' "$FAKE_PREPARE_MACHINE"
         })
         result = checked(["bash", "-c", prepare_script], cwd=scenario_root, env=env)
         calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line]
-        return result, calls, tools.read_text(encoding="utf-8"), github_path, runner_temp
+        return result, calls, tools.read_text(encoding="utf-8"), github_path, runner_temp, shm
 
-    result, calls, tools_log, github_path, runner_temp = run_prepare("clean")
+    result, calls, tools_log, github_path, runner_temp, shm = run_prepare("clean")
     require_success(result, "behavioral gate environment preparation")
     curl_calls = [call for call in calls if call["tool"] == "curl"]
     if len(curl_calls) != 1 or STRACE_URL not in curl_calls[0]["args"]:
@@ -1145,18 +1312,23 @@ printf '%s\n' "$FAKE_PREPARE_MACHINE"
     make_calls = [call["args"] for call in calls if call["tool"] == "make"]
     if make_calls != [["-j2"], ["install"]]:
         raise SystemExit(f"gate preparation must build then install the pinned tracer: {make_calls}")
-    gate_root = runner_temp / "jayflow-gate"
+    gate_root = shm / "jayflow-gate"
+    gate_tmpdir = shm / "jayflow-tmp"
     if not (gate_root / "tasks").is_dir():
         raise SystemExit("gate preparation did not create the required tasks directory under the gate root")
-    for directory in (gate_root, gate_root / "tasks"):
+    if not gate_tmpdir.is_dir():
+        raise SystemExit("gate preparation did not create the dedicated TMPDIR on the tmpfs")
+    for directory in (gate_root, gate_root / "tasks", gate_tmpdir):
         if oct(directory.stat().st_mode & 0o777) != "0o700":
             raise SystemExit(f"{directory} must be exactly mode 0700")
+    if (runner_temp / "jayflow-gate").exists() or (runner_temp / "jayflow-tmp").exists():
+        raise SystemExit("gate preparation provisioned the gates inside the runner temp")
     if github_path.read_text(encoding="utf-8") != f"{runner_temp}/strace-7.1/bin\n":
         raise SystemExit("gate preparation must prepend exactly the built tracer directory to PATH")
     if "sysctl -w" in tools_log:
         raise SystemExit("gate preparation relaxed the kernel although the namespace already worked")
 
-    result, calls, tools_log, github_path, runner_temp = run_prepare(
+    result, calls, tools_log, github_path, runner_temp, shm = run_prepare(
         "restricted", userns="blocked", apparmor="1"
     )
     require_success(result, "behavioral gate preparation under AppArmor userns restriction")
@@ -1177,14 +1349,43 @@ printf '%s\n' "$FAKE_PREPARE_MACHINE"
         ("wrong-machine", {"machine": "aarch64"}),
         ("userns-unavailable", {"userns": "blocked", "apparmor": "0"}),
         ("userns-unfixable", {"userns": "blocked", "apparmor": "1", "fixable": "0"}),
+        # The scratch filesystem is measured: an ext4 gate root reinstates the
+        # immediate inode recycling the identity races fail on.
+        ("scratch-not-tmpfs", {"fstype": "ext2/ext3"}),
+        ("scratch-tmpfs-too-small", {"free": "2147483647"}),
+        # Neither provisioned path may land where the gates refuse to work.
+        ("gate-root-inside-home", {"gate_root": str(real_home / "jayflow-gate")}),
+        ("gate-tmpdir-inside-home", {"gate_tmpdir": str(real_home / "jayflow-tmp")}),
+        ("gate-root-inside-runner-temp", {"gate_root": "@RUNNER_TEMP@/jayflow-gate"}),
+        ("gate-tmpdir-inside-runner-temp", {"gate_tmpdir": "@RUNNER_TEMP@/jayflow-tmp"}),
+        ("gate-root-inside-workspace", {"gate_root": "@WORKSPACE@/jayflow-gate"}),
     ):
-        result, calls, tools_log, github_path, runner_temp = run_prepare(scenario, **options)
+        result, calls, tools_log, github_path, runner_temp, shm = run_prepare(scenario, **options)
         if result.returncode == 0:
             raise SystemExit(f"gate preparation accepted injected failure {scenario}")
         if github_path.exists():
             raise SystemExit(f"gate preparation exported the environment despite failure {scenario}")
         if scenario == "sha-mismatch" and any(call["tool"] in {"configure", "make"} for call in calls):
             raise SystemExit("an unverified tarball must never be configured or built")
+        for refused in (real_home / "jayflow-gate", real_home / "jayflow-tmp"):
+            if refused.exists():
+                raise SystemExit(f"{scenario} created {refused} inside the real home before refusing")
+
+    # The cleanup step must actually free the tmpfs, including the task
+    # directories a failed gate left behind.
+    cleanup_root = prepare_temp / "cleanup"
+    cleanup_root.mkdir()
+    left_root = cleanup_root / "jayflow-gate"
+    (left_root / "tasks" / "gateway-trace").mkdir(parents=True)
+    (left_root / "tasks" / "gateway-trace" / "payload").write_bytes(b"x" * 1024)
+    left_tmpdir = cleanup_root / "jayflow-tmp"
+    (left_tmpdir / "go-build123").mkdir(parents=True)
+    cleanup_env = safe_env.copy()
+    cleanup_env.update({"GATE_ROOT": str(left_root), "GATE_TMPDIR": str(left_tmpdir)})
+    cleanup_result = checked(["bash", "-c", cleanup_script], cwd=cleanup_root, env=cleanup_env)
+    require_success(cleanup_result, "behavioral gate tmpfs cleanup")
+    if left_root.exists() or left_tmpdir.exists():
+        raise SystemExit("the cleanup step left the gate tmpfs occupied")
 
 
 linux_build_step = step_named(linux_steps, "Build and audit reproducible Linux gateway")
