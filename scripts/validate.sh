@@ -223,6 +223,7 @@ require_order(names(accept_steps), [
     "Audit transported Linux bytes",
     "Expose the runner browser as Chromium",
     "Install acceptance frontend dependencies",
+    "Stage the acceptance inputs outside the runner home",
     "Run real-systemd and Playwright acceptance",
     "Collect acceptance diagnostics",
 ], "accept_linux")
@@ -943,6 +944,17 @@ def names_gate_tmpfs(text):
 # instead of being forbidden outright: everywhere else in the job, naming either
 # path still means the gate environment leaked in.
 ACCEPT_DIAGNOSTICS_STEP_NAME = "Collect acceptance diagnostics"
+# On the hosted image /home/runner is 0750 runner:runner, so the disposable
+# jfrelNNNN user the harness creates cannot traverse it. Every input the harness
+# is handed has to be reachable BY THAT USER: the daemon named in the fixture
+# unit's ExecStart, the Playwright script started with `runuser -u jfrelNNNN`,
+# and the playwright-core package node resolves beside it. The disposable VM
+# where this harness passed 8/8 kept all of them under /opt with a+rX; this is
+# that layout, reproduced on the runner. A path under the home is not a weaker
+# acceptance, it is an EACCES the harness can only report as "the daemon fixture
+# did not become active".
+ACCEPT_STAGE_STEP_NAME = "Stage the acceptance inputs outside the runner home"
+ACCEPTANCE_ROOT = "/opt/jayflow-acceptance"
 ACCEPT_DIAGNOSTICS_LAYOUT_LINES = (
     "stat -c '%a %U:%G %n' /home /run/user /tmp /dev/shm",
     "mount | grep -E '/home|/tmp|/dev/shm|/run/user'",
@@ -1810,6 +1822,218 @@ for forbidden in ("playwright install", "npx playwright", "npm install"):
     if forbidden in accept_text:
         raise SystemExit(f"accept_linux must not download a browser or use unpinned install: {forbidden}")
 
+# ---- the acceptance inputs are staged outside the runner home --------------
+# Everything the disposable user has to read is copied to ACCEPTANCE_ROOT and
+# made a+rX there. The copies are `install`/`cp -RL`, never links: a symlink
+# under /opt still resolves back into /home/runner, and the harness itself
+# refuses a symlinked input outright.
+stage_step = step_named(accept_steps, ACCEPT_STAGE_STEP_NAME)
+if accept_steps.index(stage_step) != accept_steps.index(
+    step_named(accept_steps, "Run real-systemd and Playwright acceptance")
+) - 1:
+    raise SystemExit(
+        "the acceptance inputs must be staged in the step immediately before the acceptance"
+    )
+if stage_step.get("env") != {"VERSION": "${{ needs.build_linux.outputs.version }}"}:
+    raise SystemExit("the staging step must be bound to exactly the build_linux version")
+if "working-directory" in stage_step:
+    raise SystemExit("the staging step must run from the workspace root, not inside a checkout")
+stage_script = stage_step["run"]
+STAGE_REQUIRED = (
+    "set -euo pipefail",
+    f'ACCEPTANCE_ROOT={ACCEPTANCE_ROOT}',
+    # Fail closed rather than copy into whatever a previous run left behind.
+    'if [ -e "$ACCEPTANCE_ROOT" ]; then',
+    # root-owned tree, world-traversable, on a filesystem the runner home does
+    # not gate.
+    "sudo install -d -m 0755 -o root -g root",
+    '"$ACCEPTANCE_ROOT" "$ACCEPTANCE_ROOT/tests" "$ACCEPTANCE_ROOT/scripts" "$ACCEPTANCE_ROOT/node_modules"',
+    # The two executables, under the names the harness demands: the gateway
+    # carries the release version, the daemon is plain jayflowd.
+    "sudo install -m 0755 -o root -g root",
+    '-- "$GATEWAY_SOURCE" "$ACCEPTANCE_ROOT/jayflow-web-${VERSION}-linux-amd64"',
+    '-- "$DAEMON_SOURCE" "$ACCEPTANCE_ROOT/jayflowd"',
+    # The harness and the Playwright script are data, staged 0644.
+    "sudo install -m 0644 -o root -g root",
+    '-- source/tests/mobile-release-systemd.sh "$ACCEPTANCE_ROOT/tests/mobile-release-systemd.sh"',
+    "-- source/cmd/jayflow/frontend/scripts/mobile-release.playwright.mjs",
+    '"$ACCEPTANCE_ROOT/scripts/mobile-release.playwright.mjs"',
+    # node resolves playwright-core by walking up from the script, so the
+    # package has to be a real directory beside scripts/. -L, never a link.
+    "sudo cp -RL",
+    "-- source/cmd/jayflow/frontend/node_modules/playwright-core",
+    '"$ACCEPTANCE_ROOT/node_modules/playwright-core"',
+    'sudo chmod -R a+rX "$ACCEPTANCE_ROOT"',
+)
+for required in STAGE_REQUIRED:
+    if required not in stage_script:
+        raise SystemExit(f"the acceptance staging step is missing: {required}")
+# The traversable bit is the whole point of the step: without it root's 0755
+# directories still hide 0700 subtrees copied out of the npm cache.
+if 'sudo chmod -R a+rX "$ACCEPTANCE_ROOT"' not in stage_script:
+    raise SystemExit("the staged tree must end up readable and traversable by the disposable user")
+stage_writes = [
+    line.strip().rstrip("\\").strip()
+    for line in stage_script.splitlines()
+    if not line.strip().startswith("#") and line.strip().startswith("sudo ")
+]
+if stage_writes[-1] != 'sudo chmod -R a+rX "$ACCEPTANCE_ROOT"':
+    raise SystemExit(
+        f"the staging step must finish by opening the tree, last elevation is {stage_writes[-1]!r}"
+    )
+for forbidden in ("ln -s", "ln -sfn", "cp -a", "cp -r ", "cp -R ", "mv "):
+    if forbidden in stage_script:
+        raise SystemExit(f"the staged tree must be a dereferenced copy, found: {forbidden}")
+# The staged bytes have to be the SAME bytes the auditors accepted: a copy that
+# silently truncated would still start, and the acceptance would then be proving
+# a byte no release ever ships.
+for required in (
+    'GATEWAY_SHA256="$(sha256sum -- "$GATEWAY_SOURCE" | cut -d\' \' -f1)"',
+    'DAEMON_SHA256="$(sha256sum -- "$DAEMON_SOURCE" | cut -d\' \' -f1)"',
+    'STAGED_GATEWAY_SHA256="$(sha256sum -- "$ACCEPTANCE_ROOT/jayflow-web-${VERSION}-linux-amd64" | cut -d\' \' -f1)"',
+    'STAGED_DAEMON_SHA256="$(sha256sum -- "$ACCEPTANCE_ROOT/jayflowd" | cut -d\' \' -f1)"',
+    'if [ "$GATEWAY_SHA256" != "$STAGED_GATEWAY_SHA256" ]; then',
+    'if [ "$DAEMON_SHA256" != "$STAGED_DAEMON_SHA256" ]; then',
+    # Both digests land in the job log, so a later run can be compared against
+    # what build_linux and the acceptance auditor recorded.
+    "printf 'staged gateway sha256: %s\\n' \"$STAGED_GATEWAY_SHA256\"",
+    "printf 'staged daemon sha256: %s\\n' \"$STAGED_DAEMON_SHA256\"",
+):
+    if required not in stage_script:
+        raise SystemExit(f"the staging step does not verify the transported bytes: {required}")
+# A symlink anywhere in the staged tree is a path back under the runner home,
+# and the harness refuses a symlinked input anyway.
+if 'find "$ACCEPTANCE_ROOT" -type l' not in stage_script:
+    raise SystemExit("the staging step must prove the staged tree holds no symlink")
+
+# Behavioural: the staging step really has to produce a tree the disposable user
+# could traverse, out of the same bytes the auditors accepted. The absolute
+# staged root cannot exist inside a sandbox, so the simulation relocates exactly
+# that prefix - the literal /opt paths are pinned textually above; this only
+# moves them - and elevates through a stub that records the arguments and drops
+# the root ownership an unprivileged simulation cannot grant.
+with tempfile.TemporaryDirectory() as stage_text:
+    stage_root = pathlib.Path(stage_text)
+    frontend = stage_root / "source" / "cmd" / "jayflow" / "frontend"
+    (frontend / "scripts").mkdir(parents=True)
+    (stage_root / "source" / "tests").mkdir(parents=True)
+    (stage_root / "candidate").mkdir()
+    stage_runner = stage_root / "runner"
+    stage_runner.mkdir()
+    (stage_root / "source" / "tests" / "mobile-release-systemd.sh").write_text(
+        "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
+    )
+    (frontend / "scripts" / "mobile-release.playwright.mjs").write_text(
+        "process.exit(0)\n", encoding="utf-8"
+    )
+    core = frontend / "node_modules" / "playwright-core"
+    (core / "lib").mkdir(parents=True)
+    (core / "package.json").write_text('{"name":"playwright-core"}\n', encoding="utf-8")
+    (core / "lib" / "real.js").write_text("module.exports = 1\n", encoding="utf-8")
+    # npm leaves links inside packages; a link staged as a link points straight
+    # back under the runner home, which is the whole defect.
+    (core / "lib" / "linked.js").symlink_to("real.js")
+    # 0700 out of the npm cache: the chmod at the end of the step is what makes
+    # this reachable at all.
+    (core / "lib").chmod(0o700)
+    stage_version = "2.0.33-dev"
+    staged_gateway_source = stage_root / "candidate" / f"jayflow-web-{stage_version}-linux-amd64"
+    staged_gateway_source.write_bytes(b"transported gateway bytes\n")
+    staged_gateway_source.chmod(0o755)
+    staged_daemon_source = stage_runner / "jayflowd-acceptance"
+    staged_daemon_source.write_bytes(b"acceptance daemon bytes\n")
+    staged_daemon_source.chmod(0o755)
+    stage_bin = stage_root / "bin"
+    stage_bin.mkdir()
+    stage_log = stage_root / "sudo.log"
+    stage_sudo = stage_bin / "sudo"
+    stage_sudo.write_text(r"""#!/usr/bin/env bash
+printf 'sudo %s\n' "$*" >> "$FAKE_STAGE_LOG"
+ARGS=()
+SKIP=0
+for ARGUMENT in "$@"; do
+  if [ "$SKIP" = 1 ]; then SKIP=0; continue; fi
+  case "$ARGUMENT" in
+    -o|-g) SKIP=1; continue ;;
+  esac
+  ARGS+=("$ARGUMENT")
+done
+# A staged copy that silently diverged from the audited byte: the step has to
+# notice, because a daemon that still starts would make the acceptance green
+# over a byte no release ships.
+case "${FAKE_STAGE_FAILURE:-}" in
+  corrupt-gateway) PATTERN='jayflow-web-' ;;
+  corrupt-daemon) PATTERN='/jayflowd' ;;
+  *) PATTERN='' ;;
+esac
+if [ -n "$PATTERN" ] && [ "${ARGS[0]}" = install ]; then
+  case " $* " in
+    *"$PATTERN"*)
+      "${ARGS[@]}"
+      printf 'x' >> "${ARGS[$((${#ARGS[@]} - 1))]}"
+      exit 0
+      ;;
+  esac
+fi
+exec "${ARGS[@]}"
+""", encoding="utf-8")
+    stage_sudo.chmod(0o755)
+    simulated_staging = stage_script.replace(
+        ACCEPTANCE_ROOT, str(stage_root / "opt" / "jayflow-acceptance")
+    )
+    stage_env = safe_env.copy()
+    stage_env.update({
+        "PATH": str(stage_bin) + os.pathsep + safe_env["PATH"],
+        "VERSION": stage_version,
+        "RUNNER_TEMP": str(stage_runner),
+        "FAKE_STAGE_LOG": str(stage_log),
+    })
+    result = checked(["bash", "-c", simulated_staging], cwd=stage_root, env=stage_env)
+    require_success(result, "behavioral acceptance staging")
+    staged = stage_root / "opt" / "jayflow-acceptance"
+    for relative in (
+        f"jayflow-web-{stage_version}-linux-amd64",
+        "jayflowd",
+        "tests/mobile-release-systemd.sh",
+        "scripts/mobile-release.playwright.mjs",
+        "node_modules/playwright-core/package.json",
+        "node_modules/playwright-core/lib/real.js",
+        "node_modules/playwright-core/lib/linked.js",
+    ):
+        if not (staged / relative).is_file():
+            raise SystemExit(f"the staging step did not stage {relative}")
+    if list(staged.rglob("*")) != [path for path in staged.rglob("*") if not path.is_symlink()]:
+        raise SystemExit("the staged tree still contains a symlink back under the runner home")
+    if (staged / f"jayflow-web-{stage_version}-linux-amd64").read_bytes() != staged_gateway_source.read_bytes():
+        raise SystemExit("the staged gateway is not the transported byte")
+    if (staged / "jayflowd").read_bytes() != staged_daemon_source.read_bytes():
+        raise SystemExit("the staged daemon is not the audited byte")
+    for path in staged.rglob("*"):
+        mode = path.stat().st_mode & 0o7777
+        if not mode & 0o004 or (path.is_dir() and not mode & 0o001):
+            raise SystemExit(f"the staged {path} is not readable/traversable by the disposable user")
+    for digest in (
+        hashlib.sha256(staged_gateway_source.read_bytes()).hexdigest(),
+        hashlib.sha256(staged_daemon_source.read_bytes()).hexdigest(),
+    ):
+        if digest not in result.stdout:
+            raise SystemExit("the staging step did not print both staged digests")
+    elevated = stage_log.read_text(encoding="utf-8")
+    for required in ("install -d -m 0755 -o root -g root", "cp -RL", "chmod -R a+rX"):
+        if required not in elevated:
+            raise SystemExit(f"the staging step did not elevate for {required}")
+    # A root that already exists is a previous run's tree, not this run's bytes.
+    result = checked(["bash", "-c", simulated_staging], cwd=stage_root, env=stage_env)
+    if result.returncode == 0:
+        raise SystemExit("the staging step reused an acceptance root that already existed")
+    for failure in ("corrupt-gateway", "corrupt-daemon"):
+        shutil.rmtree(staged.parent)
+        failing_env = stage_env.copy()
+        failing_env["FAKE_STAGE_FAILURE"] = failure
+        result = checked(["bash", "-c", simulated_staging], cwd=stage_root, env=failing_env)
+        if result.returncode == 0:
+            raise SystemExit(f"the staging step accepted a staged byte that diverged: {failure}")
+
 acceptance_step = step_named(accept_steps, "Run real-systemd and Playwright acceptance")
 # The harness refuses to touch anything without both opt-ins: without
 # JAYFLOW_SYSTEMD_TEST=1 it prints SKIP and exits 0, and without
@@ -1823,10 +2047,11 @@ if acceptance_step.get("env") != {
 }:
     raise SystemExit("acceptance harness identity/opt-ins are not bound to build_linux")
 acceptance_script = acceptance_step["run"]
-# The harness is checked out 100644 — it is data, not an executable — so it can
-# only be started through an explicit interpreter. Naming the path on its own
-# is the defect this pins shut: sudo answers `command not found`.
-ACCEPTANCE_HARNESS = "source/tests/mobile-release-systemd.sh"
+# The harness is staged 0644 from a 100644 blob — it is data, not an
+# executable — so it can only be started through an explicit interpreter.
+# Naming the path on its own is the defect this pins shut: sudo answers
+# `command not found`.
+ACCEPTANCE_HARNESS = f"{ACCEPTANCE_ROOT}/tests/mobile-release-systemd.sh"
 if acceptance_script.count(ACCEPTANCE_HARNESS) != 1:
     raise SystemExit("accept_linux must name the systemd harness exactly once")
 if f"bash {ACCEPTANCE_HARNESS}" not in acceptance_script:
@@ -1837,14 +2062,42 @@ if f"bash {ACCEPTANCE_HARNESS}" not in acceptance_script:
 # carried across the elevation by name: the browser it drives and both opt-ins.
 ACCEPTANCE_PRESERVED = ("JAYFLOW_CHROMIUM", "JAYFLOW_SYSTEMD_TEST", "JAYFLOW_DISPOSABLE_CONFIRM")
 exact_acceptance = '''sudo --preserve-env=JAYFLOW_CHROMIUM,JAYFLOW_SYSTEMD_TEST,JAYFLOW_DISPOSABLE_CONFIRM \\
-  bash source/tests/mobile-release-systemd.sh \\
-  --gateway "$PWD/candidate/jayflow-web-${VERSION}-linux-amd64" \\
-  --daemon "$RUNNER_TEMP/jayflowd-acceptance" \\
+  bash /opt/jayflow-acceptance/tests/mobile-release-systemd.sh \\
+  --gateway "/opt/jayflow-acceptance/jayflow-web-${VERSION}-linux-amd64" \\
+  --daemon /opt/jayflow-acceptance/jayflowd \\
   --version "$VERSION" \\
   --source-sha "$SOURCE_SHA" \\
-  --playwright "$PWD/source/cmd/jayflow/frontend/scripts/mobile-release.playwright.mjs"'''
+  --playwright /opt/jayflow-acceptance/scripts/mobile-release.playwright.mjs'''
 if exact_acceptance not in acceptance_script:
     raise SystemExit("accept_linux does not invoke the exact transported-byte systemd harness")
+# Nothing below the runner home may reach the harness. The disposable user is
+# not in the runner group and /home/runner is 0750, so a $RUNNER_TEMP, $PWD or
+# $GITHUB_WORKSPACE path in the fixture unit or in the Playwright invocation is
+# an EACCES for the very user the harness runs everything as.
+acceptance_lines = acceptance_script.splitlines()
+invocation_start = [
+    index for index, line in enumerate(acceptance_lines)
+    if line.strip().startswith("sudo --preserve-env=")
+]
+invocation_end = [index for index, line in enumerate(acceptance_lines) if "| tee " in line]
+if len(invocation_start) != 1 or len(invocation_end) != 1 or invocation_end[0] <= invocation_start[0]:
+    raise SystemExit("accept_linux must invoke the harness exactly once, transcript piped to tee")
+harness_invocation = "\n".join(acceptance_lines[invocation_start[0]:invocation_end[0]])
+for forbidden in (
+    "$HOME", "${HOME", "$RUNNER_TEMP", "${RUNNER_TEMP",
+    "$GITHUB_WORKSPACE", "${GITHUB_WORKSPACE", "$PWD", "${PWD",
+    "candidate/", "source/",
+):
+    if forbidden in harness_invocation:
+        raise SystemExit(
+            f"the harness must not be handed a path the disposable user cannot traverse: {forbidden}"
+        )
+harness_paths = re.findall(r"(?:bash|--gateway|--daemon|--playwright)\s+\"?(/[^\"\s\\]+)", harness_invocation)
+if len(harness_paths) != 4:
+    raise SystemExit(f"the harness invocation names {harness_paths}, want four absolute staged paths")
+for path in harness_paths:
+    if not path.startswith(ACCEPTANCE_ROOT + "/"):
+        raise SystemExit(f"the harness is handed {path}, which is not under {ACCEPTANCE_ROOT}")
 preserve_flags = re.findall(r"--preserve-env=(\S+)", acceptance_script)
 if len(preserve_flags) != 1:
     raise SystemExit("accept_linux must elevate the harness exactly once, with one --preserve-env")
@@ -1898,7 +2151,9 @@ printf '%s %s\n' "$(basename "$0")" "$*" >> "$FAKE_ACCEPT_TOOL_LOG"
 exit 0
 ''', encoding="utf-8")
         stub.chmod(0o755)
-    harness = accept_temp / "source" / "tests" / "mobile-release-systemd.sh"
+    staged_accept_root = accept_temp / "opt" / "jayflow-acceptance"
+    (staged_accept_root / "tests").mkdir(parents=True)
+    harness = staged_accept_root / "tests" / "mobile-release-systemd.sh"
     harness.write_text(r'''#!/usr/bin/env bash
 set -euo pipefail
 printf 'harness %s\n' "$*" >> "$FAKE_ACCEPT_TOOL_LOG"
@@ -1989,7 +2244,9 @@ exit 0
     result = checked(["bash", "-c", accept_audit["run"]], cwd=accept_temp, env=audit_failure_env)
     if result.returncode == 0:
         raise SystemExit("accept_linux accepted injected static audit failure")
-    result = checked(["bash", "-c", acceptance_script], cwd=accept_temp, env=accept_env)
+    # Same relocation as the staging simulation: only the absolute prefix moves.
+    simulated_acceptance = acceptance_script.replace(ACCEPTANCE_ROOT, str(staged_accept_root))
+    result = checked(["bash", "-c", simulated_acceptance], cwd=accept_temp, env=accept_env)
     require_success(result, "behavioral Linux systemd/Playwright acceptance")
     observed_tools = accept_log.read_text(encoding="utf-8")
     for required in ("sudo ", "harness ", "systemctl ", "loginctl ", "runuser ", "useradd ", "userdel ", "chromium "):
@@ -2008,7 +2265,7 @@ exit 0
     ):
         failing_env = accept_env.copy()
         failing_env["FAKE_ACCEPT_FAILURE"] = failure
-        result = checked(["bash", "-c", acceptance_script], cwd=accept_temp, env=failing_env)
+        result = checked(["bash", "-c", simulated_acceptance], cwd=accept_temp, env=failing_env)
         if result.returncode == 0:
             raise SystemExit(f"accept_linux accepted injected failure {failure}")
 
@@ -2040,6 +2297,7 @@ ACCEPT_STEP_NAMES = (
     "Set up Node.js",
     "Expose the runner browser as Chromium",
     "Install acceptance frontend dependencies",
+    ACCEPT_STAGE_STEP_NAME,
     "Run real-systemd and Playwright acceptance",
     ACCEPT_DIAGNOSTICS_STEP_NAME,
 )
@@ -2047,13 +2305,24 @@ if tuple(names(accept_steps)) != ACCEPT_STEP_NAMES:
     raise SystemExit(
         f"accept_linux steps are {names(accept_steps)}, want exactly {list(ACCEPT_STEP_NAMES)}"
     )
-# And the whole job may reach for root exactly three times, each pinned by name
-# and by target: the symlink that exposes the runner's browser, the harness
-# itself, and the system journal the diagnostics read.
+# And every elevation in the whole job is pinned by name and by target: the
+# seven writes that stage the acceptance inputs where the disposable user can
+# reach them, the symlink that exposes the runner's browser, the harness itself,
+# and the two journal reads of the diagnostics.
 ACCEPT_ELEVATIONS = (
+    # Staging the acceptance inputs on a filesystem the disposable user can
+    # traverse: one directory tree, four files, one package, one opening chmod.
+    "sudo install -d -m 0755 -o root -g root",
+    "sudo install -m 0755 -o root -g root",
+    "sudo install -m 0755 -o root -g root",
+    "sudo install -m 0644 -o root -g root",
+    "sudo install -m 0644 -o root -g root",
+    "sudo cp -RL",
+    'sudo chmod -R a+rX "$ACCEPTANCE_ROOT"',
     'sudo ln -sfn -- "$CHROMIUM_SOURCE" /usr/bin/chromium',
     "sudo --preserve-env=JAYFLOW_CHROMIUM,JAYFLOW_SYSTEMD_TEST,JAYFLOW_DISPOSABLE_CONFIRM",
     "sudo journalctl --no-pager -o short-iso --since '-30 min'",
+    "sudo journalctl --no-pager -o short-iso --since '-30 min' _COMM=jayflowd _COMM=jayflow-web _COMM=systemd",
 )
 accept_elevations = [
     elevation for step in accept_steps for elevation in elevations_in(step.get("run", ""))
@@ -2114,20 +2383,54 @@ for forbidden in (
 ):
     if forbidden in diagnostics_script:
         raise SystemExit(f"acceptance diagnostics must only read and print, found: {forbidden}")
-# Exactly one elevation, and only for the system journal: it is the only fact
-# here that an unprivileged read cannot reach.
+# Two elevations, and only for the system journal: it is the only fact here
+# that an unprivileged read cannot reach. The first read is keyword-filtered
+# across the whole journal, the second is the units' own _COMM.
 DIAGNOSTICS_JOURNAL = "sudo journalctl --no-pager -o short-iso --since '-30 min'"
+DIAGNOSTICS_UNIT_JOURNAL = (
+    "sudo journalctl --no-pager -o short-iso --since '-30 min' "
+    "_COMM=jayflowd _COMM=jayflow-web _COMM=systemd"
+)
 elevations = elevations_in(diagnostics_script)
-if elevations != [DIAGNOSTICS_JOURNAL]:
+if elevations != [DIAGNOSTICS_JOURNAL, DIAGNOSTICS_UNIT_JOURNAL]:
     raise SystemExit(
-        f"acceptance diagnostics may elevate only for {DIAGNOSTICS_JOURNAL!r}, found {elevations}"
+        "acceptance diagnostics may elevate only for the two journal reads "
+        f"{[DIAGNOSTICS_JOURNAL, DIAGNOSTICS_UNIT_JOURNAL]!r}, found {elevations}"
     )
+# Both journal reads are tolerated, and the tolerance carries the comment that
+# says why: a bare `|| true` next to a diagnostic is how a real refusal becomes
+# invisible later.
+for journal_read in (DIAGNOSTICS_JOURNAL, DIAGNOSTICS_UNIT_JOURNAL):
+    positions = [
+        index for index, line in enumerate(diagnostics_script.splitlines())
+        if line.strip().rstrip("\\").strip() == journal_read
+    ]
+    if len(positions) != 1:
+        raise SystemExit(f"acceptance diagnostics must read {journal_read!r} exactly once")
+    lines = diagnostics_script.splitlines()
+    tail = "\n".join(lines[positions[0]:positions[0] + 5])
+    if "|| true" not in tail:
+        raise SystemExit(f"the journal read {journal_read!r} must be tolerated with || true")
+    if not any(
+        lines[index].strip().startswith("#")
+        for index in range(max(0, positions[0] - 8), positions[0])
+    ):
+        raise SystemExit(f"the tolerated journal read {journal_read!r} must carry the comment that says why")
 for required in (
     'ACCEPTANCE_LOG="$RUNNER_TEMP/mobile-release-acceptance.log"',
     'cat "$ACCEPTANCE_LOG"',
     DIAGNOSTICS_JOURNAL,
-    "grep -E 'jayflow|jfrel|user@|logind|linger|apparmor|securepath|Failed|failed'",
-    "tail -n 300",
+    # R18 collected nothing usable: the harness calls `runuser` hundreds of
+    # times and every call writes two pam_unix session lines, which matched
+    # `failed`-free but matched `jfrel`, so `tail` kept only session noise. The
+    # two pam facilities are dropped before the include filter runs.
+    "grep -Ev 'pam_unix\\(runuser|pam_unix\\(systemd-user'",
+    "grep -E 'jayflowd|jayflow-web|jfrel|user@|Failed|failed|denied'",
+    "tail -n 400",
+    # And the units themselves, straight from their own _COMM, so a fixture
+    # that never execed is visible even if its message matches no keyword.
+    DIAGNOSTICS_UNIT_JOURNAL,
+    "grep -E 'jfrel|jayflow|Failed|denied'",
     "loginctl list-users --no-legend",
     "ls -la /run/user",
     "systemctl --version | head -1",

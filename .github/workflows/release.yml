@@ -1110,6 +1110,79 @@ jobs:
           set -euo pipefail
           npm ci --prefix cmd/jayflow/frontend --ignore-scripts --no-audit --no-fund
 
+      - name: Stage the acceptance inputs outside the runner home
+        # On the hosted image /home/runner is 0750 runner:runner, so the
+        # disposable jfrelNNNN user the harness creates cannot traverse it.
+        # Everything the harness hands to that user has to live somewhere else:
+        # the daemon named in the fixture unit's ExecStart, the Playwright
+        # script started with `runuser -u jfrelNNNN`, and the playwright-core
+        # package node resolves beside it. The disposable VM where this harness
+        # passed 8/8 kept all of them under /opt with a+rX; this is that layout,
+        # reproduced on the runner. Nothing here is a link: a symlink under /opt
+        # still resolves back into the home, and the harness refuses a
+        # symlinked input outright.
+        env:
+          VERSION: ${{ needs.build_linux.outputs.version }}
+        run: |
+          set -euo pipefail
+          ACCEPTANCE_ROOT=/opt/jayflow-acceptance
+          GATEWAY_SOURCE="candidate/jayflow-web-${VERSION}-linux-amd64"
+          DAEMON_SOURCE="$RUNNER_TEMP/jayflowd-acceptance"
+          # A root that already exists is a previous run's tree, not this run's
+          # transported bytes, and copying into it would hide the difference.
+          if [ -e "$ACCEPTANCE_ROOT" ]; then
+            echo "::error::${ACCEPTANCE_ROOT} already exists on this runner"
+            exit 1
+          fi
+          sudo install -d -m 0755 -o root -g root \
+            "$ACCEPTANCE_ROOT" "$ACCEPTANCE_ROOT/tests" "$ACCEPTANCE_ROOT/scripts" "$ACCEPTANCE_ROOT/node_modules"
+          # The two executables, under the names the harness demands: the
+          # gateway file name carries the release version, the daemon is plain
+          # jayflowd.
+          sudo install -m 0755 -o root -g root \
+            -- "$GATEWAY_SOURCE" "$ACCEPTANCE_ROOT/jayflow-web-${VERSION}-linux-amd64"
+          sudo install -m 0755 -o root -g root \
+            -- "$DAEMON_SOURCE" "$ACCEPTANCE_ROOT/jayflowd"
+          # The harness and the Playwright script are data, staged 0644 exactly
+          # as `git ls-tree` reports them, so both are started through an
+          # explicit interpreter.
+          sudo install -m 0644 -o root -g root \
+            -- source/tests/mobile-release-systemd.sh "$ACCEPTANCE_ROOT/tests/mobile-release-systemd.sh"
+          sudo install -m 0644 -o root -g root \
+            -- source/cmd/jayflow/frontend/scripts/mobile-release.playwright.mjs \
+            "$ACCEPTANCE_ROOT/scripts/mobile-release.playwright.mjs"
+          # node resolves `playwright-core` by walking up from the script it
+          # runs, so the package has to be a real directory beside scripts/.
+          # -L, never a link: npm leaves links inside packages, and a staged
+          # link is a path straight back under /home/runner.
+          sudo cp -RL \
+            -- source/cmd/jayflow/frontend/node_modules/playwright-core \
+            "$ACCEPTANCE_ROOT/node_modules/playwright-core"
+          # The opening chmod is the point of the whole step: root's 0755
+          # directories still hide the 0700 subtrees npm left in the package.
+          sudo chmod -R a+rX "$ACCEPTANCE_ROOT"
+          # The staged bytes must be the SAME bytes build_linux and the
+          # acceptance auditor accepted. Both digests are printed, so a run can
+          # be compared against what those two steps recorded.
+          GATEWAY_SHA256="$(sha256sum -- "$GATEWAY_SOURCE" | cut -d' ' -f1)"
+          DAEMON_SHA256="$(sha256sum -- "$DAEMON_SOURCE" | cut -d' ' -f1)"
+          STAGED_GATEWAY_SHA256="$(sha256sum -- "$ACCEPTANCE_ROOT/jayflow-web-${VERSION}-linux-amd64" | cut -d' ' -f1)"
+          STAGED_DAEMON_SHA256="$(sha256sum -- "$ACCEPTANCE_ROOT/jayflowd" | cut -d' ' -f1)"
+          printf 'staged gateway sha256: %s\n' "$STAGED_GATEWAY_SHA256"
+          printf 'staged daemon sha256: %s\n' "$STAGED_DAEMON_SHA256"
+          if [ "$GATEWAY_SHA256" != "$STAGED_GATEWAY_SHA256" ]; then
+            echo "::error::the staged gateway is not the transported byte build_linux audited"
+            exit 1
+          fi
+          if [ "$DAEMON_SHA256" != "$STAGED_DAEMON_SHA256" ]; then
+            echo "::error::the staged daemon is not the byte the acceptance auditor accepted"
+            exit 1
+          fi
+          if [ -n "$(find "$ACCEPTANCE_ROOT" -type l -print -quit)" ]; then
+            echo "::error::the staged acceptance tree contains a symlink"
+            exit 1
+          fi
+
       - name: Run real-systemd and Playwright acceptance
         env:
           VERSION: ${{ needs.build_linux.outputs.version }}
@@ -1123,16 +1196,22 @@ jobs:
         run: |
           set -euo pipefail
           ACCEPTANCE_LOG="$RUNNER_TEMP/mobile-release-acceptance.log"
-          # The harness is checked out 100644, so it is started through bash;
-          # and sudo resets the environment, so the browser and both opt-ins are
-          # carried across the elevation by name.
+          # Every path handed to the harness is the staged copy under
+          # /opt/jayflow-acceptance, made a+rX by the step before: the
+          # disposable jfrelNNNN user cannot traverse the runner's 0750
+          # /home/runner, so a $RUNNER_TEMP, $PWD or $GITHUB_WORKSPACE path in
+          # the fixture unit's ExecStart or in the Playwright invocation is an
+          # EACCES the harness can only report as "the daemon fixture did not
+          # become active". The harness is staged 0644, so it is started through
+          # bash; and sudo resets the environment, so the browser and both
+          # opt-ins are carried across the elevation by name.
           sudo --preserve-env=JAYFLOW_CHROMIUM,JAYFLOW_SYSTEMD_TEST,JAYFLOW_DISPOSABLE_CONFIRM \
-            bash source/tests/mobile-release-systemd.sh \
-            --gateway "$PWD/candidate/jayflow-web-${VERSION}-linux-amd64" \
-            --daemon "$RUNNER_TEMP/jayflowd-acceptance" \
+            bash /opt/jayflow-acceptance/tests/mobile-release-systemd.sh \
+            --gateway "/opt/jayflow-acceptance/jayflow-web-${VERSION}-linux-amd64" \
+            --daemon /opt/jayflow-acceptance/jayflowd \
             --version "$VERSION" \
             --source-sha "$SOURCE_SHA" \
-            --playwright "$PWD/source/cmd/jayflow/frontend/scripts/mobile-release.playwright.mjs" \
+            --playwright /opt/jayflow-acceptance/scripts/mobile-release.playwright.mjs \
             | tee "$ACCEPTANCE_LOG"
           REQUIRED_GATES=(
             "playwright: 390x844 layout PASS"
@@ -1176,9 +1255,25 @@ jobs:
           # trap, and the only read here that root is needed for. `|| true`
           # explicitly: a filter that matches nothing, or a journal this runner
           # declines, must not replace the acceptance failure with its own.
+          # R18 collected nothing usable here: the harness calls `runuser`
+          # hundreds of times and every call writes two pam_unix session lines,
+          # which carry `jfrel`, so `tail` kept only session noise and dropped
+          # the exec failure. Both pam facilities are dropped before the include
+          # filter runs, and the tail is deeper.
           sudo journalctl --no-pager -o short-iso --since '-30 min' \
-            | grep -E 'jayflow|jfrel|user@|logind|linger|apparmor|securepath|Failed|failed' \
-            | tail -n 300 || true
+            | grep -Ev 'pam_unix\(runuser|pam_unix\(systemd-user' \
+            | grep -E 'jayflowd|jayflow-web|jfrel|user@|Failed|failed|denied' \
+            | tail -n 400 || true
+          echo "::endgroup::"
+          echo "::group::daemon and gateway journal"
+          # The units' own _COMM, so a fixture that never execed is visible even
+          # when its message matches none of the keywords above. `|| true`
+          # explicitly, for the same reason as the read before it: an empty
+          # filter or a refused journal must not replace the acceptance failure
+          # with its own.
+          sudo journalctl --no-pager -o short-iso --since '-30 min' _COMM=jayflowd _COMM=jayflow-web _COMM=systemd \
+            | grep -E 'jfrel|jayflow|Failed|denied' \
+            | tail -n 400 || true
           echo "::endgroup::"
           echo "::group::logind sessions"
           # No lingering user and no /run/user is the shape of a user manager
