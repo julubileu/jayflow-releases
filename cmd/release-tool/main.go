@@ -39,11 +39,25 @@ const (
 	releaseManifestName        = "release-manifest.json"
 	releaseSignatureName       = "release-manifest.sig"
 	checksumsName              = "checksums.txt"
+
+	// The cloudflared channel republishes Cloudflare's own linux/amd64 build so
+	// mobile provisioning can install it over the same authenticated path as
+	// everything else. It is a separate trust domain and a separate pair of
+	// names: the two files below are additive to the ten-asset release bundle,
+	// they are deliberately NOT covered by checksums.txt, and nothing in
+	// sign-bundle or verify-bundle knows they exist.
+	cloudflaredUpdateSigningDomain = "jayflow-cloudflared-update-v1"
+	cloudflaredLatestName          = "cloudflared-latest.json"
+	cloudflaredArtifactName        = "cloudflared-linux-amd64"
 )
 
 var (
 	strictVersionPattern   = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-dev)?$`)
 	strictSourceSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	// The cloudflared channel takes upstream's calendar version verbatim, so it
+	// has no -dev form and no Windows resource to bound: strict X.Y.Z only, which
+	// is exactly what the consumer's SemVer boundary accepts.
+	cloudflaredVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 )
 
 type latestManifest struct {
@@ -74,7 +88,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("command required: pubkey, sign-bundle, verify-bundle, audit-daemon, audit-windows, or audit-linux")
+		return errors.New("command required: pubkey, sign-bundle, verify-bundle, sign-cloudflared, verify-cloudflared, audit-daemon, audit-windows, or audit-linux")
 	}
 	switch args[0] {
 	case "pubkey":
@@ -118,6 +132,35 @@ func run(args []string) error {
 			return err
 		}
 		return verifyBundle(*dir, *version, *url, *linuxURL, public)
+	case "sign-cloudflared":
+		flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		version := flags.String("version", "", "upstream cloudflared version")
+		artifact := flags.String("artifact", "", "cloudflared-linux-amd64 path")
+		url := flags.String("url", "", "published cloudflared artifact URL")
+		out := flags.String("out", "", "cloudflared-latest.json path to create")
+		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
+			return errors.New("usage: sign-cloudflared -version X.Y.Z -artifact FILE -url HTTPS_URL -out FILE")
+		}
+		private, err := privateKeyFromEnv()
+		if err != nil {
+			return err
+		}
+		return signCloudflared(*artifact, *version, *url, *out, private)
+	case "verify-cloudflared":
+		flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		manifest := flags.String("manifest", "", "cloudflared-latest.json path")
+		artifact := flags.String("artifact", "", "cloudflared-linux-amd64 path")
+		publicText := flags.String("public-key", "", "base64 Ed25519 public key")
+		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
+			return errors.New("usage: verify-cloudflared -manifest FILE -artifact FILE -public-key BASE64")
+		}
+		public, err := decodePublicKey(*publicText)
+		if err != nil {
+			return err
+		}
+		return verifyCloudflared(*manifest, *artifact, public)
 	case "audit-daemon":
 		flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 		flags.SetOutput(io.Discard)
@@ -361,6 +404,129 @@ func verifyBundle(dir, version, portableURL, linuxURL string, public ed25519.Pub
 	}
 	if !bytes.Equal(gotChecksums, wantChecksums) {
 		return fmt.Errorf("%s does not match final asset bytes", checksumsName)
+	}
+	return nil
+}
+
+// signCloudflared writes the signed cloudflared-latest.json for an upstream
+// Cloudflare build. Nothing about the artifact is trusted: the caller has
+// already had to prove the bytes match a pinned digest, and this only binds
+// that digest to the version under the cloudflared domain. The URL carries no
+// authority and is therefore not signed, exactly as on the other two channels.
+func signCloudflared(artifactPath, version, artifactURL, outPath string, private ed25519.PrivateKey) error {
+	if len(private) != ed25519.PrivateKeySize {
+		return fmt.Errorf("private key is %d bytes, want %d", len(private), ed25519.PrivateKeySize)
+	}
+	if err := validateCloudflaredNames(artifactPath, outPath); err != nil {
+		return err
+	}
+	if _, err := validateCloudflaredVersion(version); err != nil {
+		return err
+	}
+	if err := validateCloudflaredURL(artifactURL); err != nil {
+		return err
+	}
+	digest, size, err := hashFile(artifactPath)
+	if err != nil {
+		return err
+	}
+	if size == 0 {
+		return fmt.Errorf("%s is empty", cloudflaredArtifactName)
+	}
+	manifest := latestManifest{Version: version, URL: artifactURL, SHA256: digest}
+	manifest.Sig = base64.StdEncoding.EncodeToString(signDetached(private,
+		channelPayload(cloudflaredUpdateSigningDomain, manifest.Version, manifest.SHA256)))
+	if err := writeJSON(outPath, manifest); err != nil {
+		return err
+	}
+	public := private.Public().(ed25519.PublicKey)
+	if err := verifyCloudflared(outPath, artifactPath, public); err != nil {
+		return fmt.Errorf("self-check: %w", err)
+	}
+	return nil
+}
+
+// verifyCloudflared re-derives everything the mobile provisioning engine will
+// re-derive: the two published names, the strict version, the https artifact
+// URL, the digest of the bytes on disk, and the signature over the cloudflared
+// domain. It never needs the private key, so the release job can run it after
+// dropping the secret.
+func verifyCloudflared(manifestPath, artifactPath string, public ed25519.PublicKey) error {
+	if len(public) != ed25519.PublicKeySize {
+		return fmt.Errorf("public key is %d bytes, want %d", len(public), ed25519.PublicKeySize)
+	}
+	if err := validateCloudflaredNames(artifactPath, manifestPath); err != nil {
+		return err
+	}
+	body, err := readRegularFile(manifestPath)
+	if err != nil {
+		return err
+	}
+	var manifest latestManifest
+	if err := decodeStrictJSON(body, &manifest); err != nil {
+		return fmt.Errorf("%s: %w", cloudflaredLatestName, err)
+	}
+	if _, err := validateCloudflaredVersion(manifest.Version); err != nil {
+		return fmt.Errorf("%s: %w", cloudflaredLatestName, err)
+	}
+	if err := validateCloudflaredURL(manifest.URL); err != nil {
+		return fmt.Errorf("%s: %w", cloudflaredLatestName, err)
+	}
+	if !validDigest(manifest.SHA256) {
+		return fmt.Errorf("%s has an invalid digest", cloudflaredLatestName)
+	}
+	signature, err := base64.StdEncoding.DecodeString(strings.TrimSpace(manifest.Sig))
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		return fmt.Errorf("%s has invalid signature encoding", cloudflaredLatestName)
+	}
+	if !ed25519.Verify(public, channelPayload(cloudflaredUpdateSigningDomain, manifest.Version, manifest.SHA256), signature) {
+		return fmt.Errorf("%s signature is invalid", cloudflaredLatestName)
+	}
+	digest, size, err := hashFile(artifactPath)
+	if err != nil {
+		return err
+	}
+	if size == 0 {
+		return fmt.Errorf("%s is empty", cloudflaredArtifactName)
+	}
+	if subtle.ConstantTimeCompare([]byte(digest), []byte(manifest.SHA256)) != 1 {
+		return fmt.Errorf("%s does not match %s bytes", cloudflaredLatestName, cloudflaredArtifactName)
+	}
+	return nil
+}
+
+func validateCloudflaredNames(artifactPath, manifestPath string) error {
+	if filepath.Base(artifactPath) != cloudflaredArtifactName {
+		return fmt.Errorf("artifact must be named %s", cloudflaredArtifactName)
+	}
+	if filepath.Base(manifestPath) != cloudflaredLatestName {
+		return fmt.Errorf("manifest must be named %s", cloudflaredLatestName)
+	}
+	return nil
+}
+
+func validateCloudflaredVersion(version string) ([3]uint64, error) {
+	match := cloudflaredVersionPattern.FindStringSubmatch(version)
+	if match == nil {
+		return [3]uint64{}, errors.New("cloudflared version must be X.Y.Z without a v prefix, leading zeroes, or a suffix")
+	}
+	var parts [3]uint64
+	for index := range parts {
+		value, err := strconv.ParseUint(match[index+1], 10, 64)
+		if err != nil {
+			return [3]uint64{}, fmt.Errorf("cloudflared version component %q is out of range", match[index+1])
+		}
+		parts[index] = value
+	}
+	return parts, nil
+}
+
+func validateCloudflaredURL(url string) error {
+	if url == "" || !strings.HasPrefix(url, "https://") {
+		return errors.New("cloudflared URL must use https")
+	}
+	if !strings.HasSuffix(url, "/"+cloudflaredArtifactName) {
+		return fmt.Errorf("cloudflared URL does not name %s", cloudflaredArtifactName)
 	}
 	return nil
 }

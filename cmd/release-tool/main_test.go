@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1462,5 +1463,320 @@ func copyFiles(t *testing.T, from, to string) {
 		if err := os.WriteFile(filepath.Join(to, entry.Name()), body, 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// The cloudflared channel is the third trust domain published by this
+// repository. Its bytes are Cloudflare's, not ours, so the only thing that
+// makes them safe to install is the Ed25519 signature this tool produces over
+// jayflow-cloudflared-update-v1 and the digest the mobile provisioning engine
+// re-checks before writing a single byte to disk.
+
+// cloudflaredRealVersion and cloudflaredRealSize pin the shape of the artifact
+// the release actually publishes: Cloudflare's linux/amd64 build of 2026.8.3,
+// sha256 f29324fe934d1e100617484c78deef803c4dc2cd351d645bbde42e96b4fccc5e,
+// 39763452 bytes. The bytes themselves are never committed; the tests rebuild
+// a same-size, same-shape ELF fixture so the digest and size paths are exercised
+// against a realistic artifact instead of a two-line stub.
+const (
+	cloudflaredRealVersion = "2026.8.3"
+	cloudflaredRealSize    = 39763452
+)
+
+func TestCloudflaredSignAndVerifyRoundTripAuthenticatesTheArtifact(t *testing.T) {
+	dir := t.TempDir()
+	artifact := writeCloudflaredFixture(t, dir, cloudflaredArtifactName, []byte("cloudflared fixture\n"))
+	manifestPath := filepath.Join(dir, cloudflaredLatestName)
+	private := vectorPrivateKey(t)
+	public := private.Public().(ed25519.PublicKey)
+	url := "https://github.com/julubileu/jayflow-releases/releases/latest/download/" + cloudflaredArtifactName
+
+	if err := signCloudflared(artifact, cloudflaredRealVersion, url, manifestPath, private); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest latestManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	digest, size, err := hashFile(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Version != cloudflaredRealVersion || manifest.URL != url || manifest.SHA256 != digest {
+		t.Fatalf("manifest = %+v, want version/url/digest %s %s %s",
+			manifest, cloudflaredRealVersion, url, digest)
+	}
+	if size == 0 {
+		t.Fatal("fixture is empty")
+	}
+	signature, err := base64.StdEncoding.DecodeString(manifest.Sig)
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		t.Fatalf("sig is not a base64 Ed25519 signature: %v", err)
+	}
+	if !ed25519.Verify(public, channelPayload(cloudflaredUpdateSigningDomain, manifest.Version, manifest.SHA256), signature) {
+		t.Fatal("the published signature does not verify under the cloudflared domain")
+	}
+	if err := verifyCloudflared(manifestPath, artifact, public); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloudflaredSignedPayloadMatchesTheConsumerContract(t *testing.T) {
+	want := "jayflow-cloudflared-update-v1\n2026.8.3\nabcdef0123456789\n"
+	got := string(channelPayload(cloudflaredUpdateSigningDomain, " v2026.8.3 ", " ABCDEF0123456789 "))
+	if got != want {
+		t.Fatalf("cloudflared payload = %q, want %q", got, want)
+	}
+	if cloudflaredArtifactName != "cloudflared-linux-amd64" || cloudflaredLatestName != "cloudflared-latest.json" {
+		t.Fatalf("published names are %q/%q, want cloudflared-linux-amd64/cloudflared-latest.json",
+			cloudflaredArtifactName, cloudflaredLatestName)
+	}
+}
+
+func TestCloudflaredVerifyRejectsForeignSigningDomains(t *testing.T) {
+	dir := t.TempDir()
+	artifact := writeCloudflaredFixture(t, dir, cloudflaredArtifactName, []byte("cloudflared fixture\n"))
+	private := vectorPrivateKey(t)
+	public := private.Public().(ed25519.PublicKey)
+	digest, _, err := hashFile(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := "https://github.com/julubileu/jayflow-releases/releases/latest/download/" + cloudflaredArtifactName
+
+	for _, domain := range []string{linuxUpdateSigningDomain, windowsUpdateSigningDomain, releaseSigningDomain} {
+		manifestPath := filepath.Join(t.TempDir(), cloudflaredLatestName)
+		manifest := latestManifest{Version: cloudflaredRealVersion, URL: url, SHA256: digest}
+		manifest.Sig = base64.StdEncoding.EncodeToString(signDetached(private,
+			channelPayload(domain, manifest.Version, manifest.SHA256)))
+		if err := writeJSON(manifestPath, manifest); err != nil {
+			t.Fatal(err)
+		}
+		err := verifyCloudflared(manifestPath, artifact, public)
+		if err == nil {
+			t.Fatalf("a %s signature was accepted on the cloudflared channel", domain)
+		}
+		if !strings.Contains(err.Error(), "signature is invalid") {
+			t.Fatalf("a %s signature was rejected for the wrong reason: %v", domain, err)
+		}
+	}
+}
+
+func TestCloudflaredRefusesRenamedArtifactAndManifest(t *testing.T) {
+	dir := t.TempDir()
+	private := vectorPrivateKey(t)
+	public := private.Public().(ed25519.PublicKey)
+	url := "https://github.com/julubileu/jayflow-releases/releases/latest/download/" + cloudflaredArtifactName
+
+	renamed := writeCloudflaredFixture(t, dir, "cloudflared", []byte("cloudflared fixture\n"))
+	if err := signCloudflared(renamed, cloudflaredRealVersion, url,
+		filepath.Join(dir, cloudflaredLatestName), private); err == nil {
+		t.Fatal("sign-cloudflared accepted an artifact that is not named cloudflared-linux-amd64")
+	}
+
+	good := t.TempDir()
+	artifact := writeCloudflaredFixture(t, good, cloudflaredArtifactName, []byte("cloudflared fixture\n"))
+	manifestPath := filepath.Join(good, cloudflaredLatestName)
+	if err := signCloudflared(artifact, cloudflaredRealVersion, url, manifestPath, private); err != nil {
+		t.Fatal(err)
+	}
+	if err := signCloudflared(artifact, cloudflaredRealVersion, url,
+		filepath.Join(good, "latest.json"), private); err == nil {
+		t.Fatal("sign-cloudflared wrote a manifest that is not named cloudflared-latest.json")
+	}
+	if err := signCloudflared(artifact, cloudflaredRealVersion,
+		"https://github.com/julubileu/jayflow-releases/releases/latest/download/cloudflared",
+		filepath.Join(good, "second-"+cloudflaredLatestName), private); err == nil {
+		t.Fatal("sign-cloudflared accepted a URL that does not name cloudflared-linux-amd64")
+	}
+	if err := signCloudflared(artifact, cloudflaredRealVersion,
+		"http://github.com/julubileu/jayflow-releases/releases/latest/download/"+cloudflaredArtifactName,
+		filepath.Join(good, "third-"+cloudflaredLatestName), private); err == nil {
+		t.Fatal("sign-cloudflared accepted a plaintext URL")
+	}
+
+	elsewhere := writeCloudflaredFixture(t, t.TempDir(), "cloudflared-linux-arm64", []byte("cloudflared fixture\n"))
+	if err := verifyCloudflared(manifestPath, elsewhere, public); err == nil {
+		t.Fatal("verify-cloudflared accepted a renamed artifact")
+	}
+	misnamed := filepath.Join(good, "cloudflared-newest.json")
+	copyManifest(t, manifestPath, misnamed)
+	if err := verifyCloudflared(misnamed, artifact, public); err == nil {
+		t.Fatal("verify-cloudflared accepted a manifest that is not named cloudflared-latest.json")
+	}
+}
+
+func TestCloudflaredVerifyRejectsDigestAndVersionTampering(t *testing.T) {
+	dir := t.TempDir()
+	artifact := writeCloudflaredFixture(t, dir, cloudflaredArtifactName, []byte("cloudflared fixture\n"))
+	private := vectorPrivateKey(t)
+	public := private.Public().(ed25519.PublicKey)
+	url := "https://github.com/julubileu/jayflow-releases/releases/latest/download/" + cloudflaredArtifactName
+	digest, _, err := hashFile(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A digest the key legitimately signed, over bytes that are not the ones on
+	// disk: the signature checks out and the artifact still has to be refused.
+	other := sha256.Sum256([]byte("some other cloudflared build"))
+	tampered := latestManifest{Version: cloudflaredRealVersion, URL: url, SHA256: hex.EncodeToString(other[:])}
+	tampered.Sig = base64.StdEncoding.EncodeToString(signDetached(private,
+		channelPayload(cloudflaredUpdateSigningDomain, tampered.Version, tampered.SHA256)))
+	tamperedPath := filepath.Join(dir, cloudflaredLatestName)
+	if err := writeJSON(tamperedPath, tampered); err != nil {
+		t.Fatal(err)
+	}
+	err = verifyCloudflared(tamperedPath, artifact, public)
+	if err == nil {
+		t.Fatal("verify-cloudflared accepted a validly signed digest that is not the artifact")
+	}
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("digest tampering was rejected for the wrong reason: %v", err)
+	}
+
+	// The same, one bit flipped in the digest field: no valid signature exists.
+	flipped := latestManifest{Version: cloudflaredRealVersion, URL: url, SHA256: digest, Sig: tampered.Sig}
+	flippedPath := filepath.Join(t.TempDir(), cloudflaredLatestName)
+	if err := writeJSON(flippedPath, flipped); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyCloudflared(flippedPath, artifact, public); err == nil {
+		t.Fatal("verify-cloudflared accepted a signature bound to a different digest")
+	}
+}
+
+func TestCloudflaredRefusesVersionsOutsideStrictXYZ(t *testing.T) {
+	dir := t.TempDir()
+	artifact := writeCloudflaredFixture(t, dir, cloudflaredArtifactName, []byte("cloudflared fixture\n"))
+	private := vectorPrivateKey(t)
+	public := private.Public().(ed25519.PublicKey)
+	url := "https://github.com/julubileu/jayflow-releases/releases/latest/download/" + cloudflaredArtifactName
+	digest, _, err := hashFile(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rejected := []string{
+		"2026.8.3-dev", "v2026.8.3", "2026.8", "2026", "2026.8.3.1",
+		"2026.08.3", "2026.8.3+build", " 2026.8.3", "", "latest",
+	}
+	for index, version := range rejected {
+		out := filepath.Join(dir, fmt.Sprintf("rejected-%d-%s", index, cloudflaredLatestName))
+		if err := signCloudflared(artifact, version, url, out, private); err == nil {
+			t.Fatalf("sign-cloudflared accepted version %q", version)
+		}
+		if _, err := os.Lstat(out); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("a rejected version %q still produced %s", version, out)
+		}
+
+		manifestPath := filepath.Join(t.TempDir(), cloudflaredLatestName)
+		manifest := latestManifest{Version: version, URL: url, SHA256: digest}
+		manifest.Sig = base64.StdEncoding.EncodeToString(signDetached(private,
+			channelPayload(cloudflaredUpdateSigningDomain, manifest.Version, manifest.SHA256)))
+		if err := writeJSON(manifestPath, manifest); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyCloudflared(manifestPath, artifact, public); err == nil {
+			t.Fatalf("verify-cloudflared accepted version %q", version)
+		}
+	}
+	if _, err := validateCloudflaredVersion(cloudflaredRealVersion); err != nil {
+		t.Fatalf("the real cloudflared version was refused: %v", err)
+	}
+}
+
+func TestCloudflaredChannelSurvivesTheRealArtifactShape(t *testing.T) {
+	dir := t.TempDir()
+	artifact := filepath.Join(dir, cloudflaredArtifactName)
+	handle, err := os.OpenFile(artifact, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Cloudflare ships a statically linked linux/amd64 ELF; reproduce the header
+	// and the exact published length without committing 38 MiB of their bytes.
+	if _, err := handle.Write([]byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Truncate(cloudflaredRealSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	private := vectorPrivateKey(t)
+	public := private.Public().(ed25519.PublicKey)
+	url := "https://github.com/julubileu/jayflow-releases/releases/latest/download/" + cloudflaredArtifactName
+	manifestPath := filepath.Join(dir, cloudflaredLatestName)
+	if err := signCloudflared(artifact, cloudflaredRealVersion, url, manifestPath, private); err != nil {
+		t.Fatal(err)
+	}
+	if _, size, err := hashFile(artifact); err != nil || size != cloudflaredRealSize {
+		t.Fatalf("fixture size = %d (%v), want %d", size, err, cloudflaredRealSize)
+	}
+	if err := verifyCloudflared(manifestPath, artifact, public); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloudflaredCLIUsesTheReleaseKeyAndRefusesOverwrites(t *testing.T) {
+	dir := t.TempDir()
+	artifact := writeCloudflaredFixture(t, dir, cloudflaredArtifactName, []byte("cloudflared fixture\n"))
+	manifestPath := filepath.Join(dir, cloudflaredLatestName)
+	private := vectorPrivateKey(t)
+	public := base64.StdEncoding.EncodeToString(private.Public().(ed25519.PublicKey))
+	url := "https://github.com/julubileu/jayflow-releases/releases/latest/download/" + cloudflaredArtifactName
+	signArgs := []string{
+		"sign-cloudflared", "-version", cloudflaredRealVersion,
+		"-artifact", artifact, "-url", url, "-out", manifestPath,
+	}
+	verifyArgs := []string{
+		"verify-cloudflared", "-manifest", manifestPath,
+		"-artifact", artifact, "-public-key", public,
+	}
+
+	t.Setenv(privateKeyEnv, "")
+	if err := run(signArgs); err == nil {
+		t.Fatal("sign-cloudflared signed without a release key")
+	}
+	t.Setenv(privateKeyEnv, base64.StdEncoding.EncodeToString(private))
+	if err := run(signArgs); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(signArgs); err == nil {
+		t.Fatal("sign-cloudflared overwrote an existing manifest")
+	}
+	if err := run(verifyArgs); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(append(append([]string(nil), signArgs...), "extra")); err == nil {
+		t.Fatal("sign-cloudflared accepted a positional argument")
+	}
+	if err := run(replaceArgument(verifyArgs, "-public-key", "not-base64")); err == nil {
+		t.Fatal("verify-cloudflared accepted a malformed public key")
+	}
+}
+
+func writeCloudflaredFixture(t *testing.T, dir, name string, body []byte) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func copyManifest(t *testing.T, from, to string) {
+	t.Helper()
+	body, err := os.ReadFile(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(to, body, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

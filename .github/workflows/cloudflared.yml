@@ -1,0 +1,216 @@
+name: Publish the signed cloudflared channel
+
+# This workflow is the additive half of a release: it republishes Cloudflare's
+# own linux/amd64 cloudflared build under a JayFlow Ed25519 signature so mobile
+# provisioning can install it over the same authenticated path as everything
+# else. It touches exactly two new asset names on an existing, already public
+# release. It never rebuilds, re-signs, replaces or deletes any of the ten
+# original assets, it never reads the private source repository, and it never
+# overwrites anything: an asset that already exists is a hard failure.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing public release tag to extend (e.g. v2.0.35)
+        required: true
+        type: string
+      cloudflared_version:
+        description: Upstream cloudflared version, X.Y.Z without a v prefix (e.g. 2026.8.3)
+        required: true
+        type: string
+      cloudflared_sha256:
+        description: Expected sha256 of cloudflared-linux-amd64, 64 lowercase hex characters
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-cloudflared-channel
+  cancel-in-progress: false
+
+jobs:
+  publish_cloudflared:
+    name: Sign and publish the cloudflared channel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_REPO: julubileu/jayflow-releases
+      CLOUDFLARED_ARTIFACT: cloudflared-linux-amd64
+      CLOUDFLARED_MANIFEST: cloudflared-latest.json
+    steps:
+      - name: Validate the dispatch inputs before anything is fetched
+        id: inputs
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          INPUT_VERSION: ${{ inputs.cloudflared_version }}
+          INPUT_SHA256: ${{ inputs.cloudflared_sha256 }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$INPUT_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-dev)?$ ]]; then
+            echo "::error::release_tag must be v<X.Y.Z> or v<X.Y.Z>-dev"
+            exit 1
+          fi
+          if [[ ! "$INPUT_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::cloudflared_version must be X.Y.Z, without a v prefix or leading zeroes"
+            exit 1
+          fi
+          if [[ ! "$INPUT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::cloudflared_sha256 must be 64 lowercase hex characters"
+            exit 1
+          fi
+          printf 'tag=%s\n' "$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          printf 'sha256=%s\n' "$INPUT_SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Check out only the public release repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go for the trusted public tool
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test and compile the trusted public tool before secret injection
+        run: |
+          set -euo pipefail
+          go test ./cmd/release-tool
+          go build -trimpath -o "$RUNNER_TEMP/jayflow-release-tool" ./cmd/release-tool
+
+      - name: Download Cloudflare's official linux/amd64 build at the exact version
+        env:
+          VERSION: ${{ steps.inputs.outputs.version }}
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/cloudflared"
+          mkdir -p "$STAGE"
+          curl --proto '=https' --tlsv1.2 \
+            --fail --silent --show-error --location \
+            --retry 3 --retry-connrefused --max-time 300 \
+            --output "$STAGE/$CLOUDFLARED_ARTIFACT" \
+            "https://github.com/cloudflare/cloudflared/releases/download/${VERSION}/${CLOUDFLARED_ARTIFACT}"
+
+      - name: Pin the downloaded bytes to the dispatched digest
+        env:
+          EXPECTED_SHA256: ${{ steps.inputs.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/cloudflared"
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$CLOUDFLARED_ARTIFACT" > "$STAGE/expected.sha256"
+          (cd "$STAGE" && sha256sum -c --strict expected.sha256)
+          rm -f "$STAGE/expected.sha256"
+
+      - name: Sign the cloudflared channel manifest
+        env:
+          JAYFLOW_RELEASE_PRIVATE_KEY: ${{ secrets.JAYFLOW_RELEASE_PRIVATE_KEY }}
+          EXPECTED_PUBLIC_KEY: ${{ vars.JAYFLOW_RELEASE_PUBLIC_KEY }}
+          VERSION: ${{ steps.inputs.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${JAYFLOW_RELEASE_PRIVATE_KEY:-}" ] || [ -z "${EXPECTED_PUBLIC_KEY:-}" ]; then
+            echo "::error::release signing key or expected public key is not configured"
+            exit 1
+          fi
+          PUBLIC_KEY="$("$RUNNER_TEMP/jayflow-release-tool" pubkey)"
+          echo "::add-mask::$PUBLIC_KEY"
+          if [ "$PUBLIC_KEY" != "$EXPECTED_PUBLIC_KEY" ]; then
+            echo "::error::the signing key does not derive the configured public key"
+            exit 1
+          fi
+          STAGE="$RUNNER_TEMP/cloudflared"
+          # The consumer pins this exact location: internal/mobileprov/release_source.go
+          # resolves the cloudflared artifact to <repo>/releases/latest/download/
+          # cloudflared-linux-amd64 and refuses any other string.
+          ARTIFACT_URL="https://github.com/julubileu/jayflow-releases/releases/latest/download/${CLOUDFLARED_ARTIFACT}"
+          "$RUNNER_TEMP/jayflow-release-tool" sign-cloudflared \
+            -version "$VERSION" \
+            -artifact "$STAGE/$CLOUDFLARED_ARTIFACT" \
+            -url "$ARTIFACT_URL" \
+            -out "$STAGE/$CLOUDFLARED_MANIFEST"
+
+      - name: Verify the signed manifest without the private key
+        env:
+          PUBLIC_KEY: ${{ vars.JAYFLOW_RELEASE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          unset JAYFLOW_RELEASE_PRIVATE_KEY
+          STAGE="$RUNNER_TEMP/cloudflared"
+          "$RUNNER_TEMP/jayflow-release-tool" verify-cloudflared \
+            -manifest "$STAGE/$CLOUDFLARED_MANIFEST" \
+            -artifact "$STAGE/$CLOUDFLARED_ARTIFACT" \
+            -public-key "$PUBLIC_KEY"
+
+      - name: Confirm the target release accepts two additive assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.inputs.outputs.tag }}
+        run: |
+          set -euo pipefail
+          RELEASE_JSON="$(gh release view "$TAG" --repo "$GH_REPO" --json isDraft,assets)"
+
+          if [ "$(jq -r '.isDraft' <<<"$RELEASE_JSON")" != "false" ]; then
+            echo "::error::${TAG} is a draft; the cloudflared channel only extends a published release"
+            exit 1
+          fi
+          for NAME in "$CLOUDFLARED_ARTIFACT" "$CLOUDFLARED_MANIFEST"; do
+            if jq -e --arg name "$NAME" 'any(.assets[]; .name == $name)' <<<"$RELEASE_JSON" >/dev/null; then
+              echo "::error::${TAG} already carries ${NAME}; refusing to overwrite a published asset"
+              exit 1
+            fi
+          done
+
+          # The signed URL resolves through /releases/latest/download, so the tag
+          # being extended has to be the release that /latest actually points at.
+          LATEST_TAG="$(gh release view --repo "$GH_REPO" --json tagName --jq '.tagName')"
+          if [ "$LATEST_TAG" != "$TAG" ]; then
+            echo "::error::latest release is ${LATEST_TAG}, not ${TAG}; the signed artifact URL would not resolve"
+            exit 1
+          fi
+
+      - name: Upload the two additive assets without clobbering
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.inputs.outputs.tag }}
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/cloudflared"
+          gh release upload "$TAG" \
+            "$STAGE/$CLOUDFLARED_ARTIFACT" \
+            "$STAGE/$CLOUDFLARED_MANIFEST" \
+            --repo "$GH_REPO"
+
+      - name: Re-download both published assets and compare byte for byte
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.inputs.outputs.tag }}
+          PUBLIC_KEY: ${{ vars.JAYFLOW_RELEASE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/cloudflared"
+          REMOTE="$RUNNER_TEMP/cloudflared-remote"
+          rm -rf "$REMOTE"
+          mkdir -p "$REMOTE"
+          gh release download "$TAG" --repo "$GH_REPO" --dir "$REMOTE" \
+            --pattern "$CLOUDFLARED_ARTIFACT" --pattern "$CLOUDFLARED_MANIFEST"
+
+          mapfile -d '' -t REMOTE_FILES < <(find "$REMOTE" -maxdepth 1 -type f -printf '%f\0' | sort -z)
+          EXPECTED_FILES=("$CLOUDFLARED_MANIFEST" "$CLOUDFLARED_ARTIFACT")
+          if [ "${REMOTE_FILES[*]}" != "${EXPECTED_FILES[*]}" ]; then
+            echo "::error::re-download produced ${REMOTE_FILES[*]}, want ${EXPECTED_FILES[*]}"
+            exit 1
+          fi
+          cmp "$STAGE/$CLOUDFLARED_ARTIFACT" "$REMOTE/$CLOUDFLARED_ARTIFACT"
+          cmp "$STAGE/$CLOUDFLARED_MANIFEST" "$REMOTE/$CLOUDFLARED_MANIFEST"
+
+          "$RUNNER_TEMP/jayflow-release-tool" verify-cloudflared \
+            -manifest "$REMOTE/$CLOUDFLARED_MANIFEST" \
+            -artifact "$REMOTE/$CLOUDFLARED_ARTIFACT" \
+            -public-key "$PUBLIC_KEY"

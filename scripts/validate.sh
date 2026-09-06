@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="$ROOT/.github/workflows/release.yml"
+CLOUDFLARED_WORKFLOW="$ROOT/.github/workflows/cloudflared.yml"
 SOURCE_REPO="${JAYFLOW_SOURCE_DIR:-$ROOT/../jayflow-v2}"
 
 fail() {
@@ -3028,5 +3029,239 @@ reject_text "actions/setup-go@v" "$WORKFLOW"
 reject_text "actions/setup-node@v" "$WORKFLOW"
 reject_text "actions/upload-artifact@v" "$WORKFLOW"
 reject_text "actions/download-artifact@v" "$WORKFLOW"
+
+
+# ---- the additive, signed cloudflared channel -------------------------------
+#
+# cloudflared.yml republishes Cloudflare's own binary under a JayFlow signature.
+# It is the only workflow allowed to add assets to an already published release,
+# so everything that keeps it from becoming a second, weaker publication path
+# is pinned here: dispatch only, one job, no private source, the signing key
+# confined to the signing step, the dispatched digest actually checked, no
+# clobbering, and exactly the two names the consumer resolves.
+
+require_file .github/workflows/cloudflared.yml
+
+python3 - "$CLOUDFLARED_WORKFLOW" "$WORKFLOW" <<'PY'
+import pathlib
+import re
+import sys
+
+import yaml
+
+cloudflared_path = pathlib.Path(sys.argv[1])
+release_path = pathlib.Path(sys.argv[2])
+text = cloudflared_path.read_text(encoding="utf-8")
+
+ARTIFACT_NAME = "cloudflared-linux-amd64"
+MANIFEST_NAME = "cloudflared-latest.json"
+CONSUMER_URL = (
+    "https://github.com/julubileu/jayflow-releases/releases/latest/download/${CLOUDFLARED_ARTIFACT}"
+)
+
+
+def bad(message):
+    raise SystemExit(f"cloudflared workflow: {message}")
+
+
+try:
+    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+except yaml.YAMLError as exc:
+    bad(f"is not valid YAML: {exc}")
+
+if not isinstance(workflow, dict):
+    bad("root is not a mapping")
+
+triggers = workflow.get("on")
+if not isinstance(triggers, dict) or set(triggers) != {"workflow_dispatch"}:
+    bad(f"triggers are {triggers!r}, want workflow_dispatch only")
+
+dispatch = triggers["workflow_dispatch"]
+if not isinstance(dispatch, dict):
+    bad("workflow_dispatch is not a mapping")
+inputs = dispatch.get("inputs")
+expected_inputs = {"release_tag", "cloudflared_version", "cloudflared_sha256"}
+if not isinstance(inputs, dict) or set(inputs) != expected_inputs:
+    bad(f"inputs are {sorted(inputs) if isinstance(inputs, dict) else inputs!r}, want {sorted(expected_inputs)}")
+for name, spec in inputs.items():
+    if not isinstance(spec, dict) or spec.get("required") != "true" or spec.get("type") != "string":
+        bad(f"input {name} must be a required string")
+    if spec.get("default") is not None:
+        bad(f"input {name} must not carry a default; every publication is dispatched explicitly")
+
+if workflow.get("permissions") != {"contents": "read"}:
+    bad(f"top-level permissions are {workflow.get('permissions')!r}, want contents: read")
+
+jobs = workflow.get("jobs")
+if not isinstance(jobs, dict) or len(jobs) != 1:
+    bad(f"has {len(jobs) if isinstance(jobs, dict) else 0} jobs, want exactly one")
+(job_name, job), = jobs.items()
+
+if job.get("runs-on") != "ubuntu-24.04":
+    bad(f"job {job_name} runs on {job.get('runs-on')!r}, want ubuntu-24.04")
+if job.get("permissions") != {"contents": "write"}:
+    bad(f"job {job_name} permissions are {job.get('permissions')!r}, want contents: write")
+timeout = job.get("timeout-minutes")
+if timeout is None or not str(timeout).isdigit() or int(timeout) > 30:
+    bad(f"job {job_name} timeout is {timeout!r}, want a short explicit budget of at most 30 minutes")
+if job.get("needs") is not None:
+    bad("the cloudflared job must stand alone; it must not depend on a build job")
+if job.get("container") is not None or job.get("services") is not None:
+    bad("the cloudflared job must not introduce containers or services")
+
+job_env = job.get("env") or {}
+if job_env.get("CLOUDFLARED_ARTIFACT") != ARTIFACT_NAME:
+    bad(f"CLOUDFLARED_ARTIFACT is {job_env.get('CLOUDFLARED_ARTIFACT')!r}, want {ARTIFACT_NAME}")
+if job_env.get("CLOUDFLARED_MANIFEST") != MANIFEST_NAME:
+    bad(f"CLOUDFLARED_MANIFEST is {job_env.get('CLOUDFLARED_MANIFEST')!r}, want {MANIFEST_NAME}")
+if job_env.get("GH_REPO") != "julubileu/jayflow-releases":
+    bad(f"GH_REPO is {job_env.get('GH_REPO')!r}, want julubileu/jayflow-releases")
+
+steps = job.get("steps")
+if not isinstance(steps, list) or not steps:
+    bad("job has no steps")
+
+
+def step_text(step):
+    # The run script is compared verbatim: re-dumping it through YAML would
+    # requote the very shell quoting these assertions are pinning.
+    rest = {key: value for key, value in step.items() if key != "run"}
+    return yaml.safe_dump(rest, sort_keys=True) + "\n" + str(step.get("run", ""))
+
+
+# ---- nothing private, nothing destructive, nothing overwritten --------------
+forbidden = {
+    "JAYFLOW_SOURCE_DEPLOY_KEY": "the private source deploy key has no business in the cloudflared channel",
+    "jayflow-v2": "the private source repository must never be checked out here",
+    "ssh-key": "no SSH key may be handed to a checkout",
+    "submodules": "no submodule checkout",
+    "--clobber": "an existing asset must never be overwritten",
+    "gh release delete": "the cloudflared channel must never delete anything",
+    "gh release edit": "the cloudflared channel must never edit the release",
+    "gh release create": "the cloudflared channel only extends an existing release",
+    "actions/checkout@v": "checkout must be pinned to a commit SHA",
+    "actions/setup-go@v": "setup-go must be pinned to a commit SHA",
+}
+for needle, why in forbidden.items():
+    if needle in text:
+        bad(f"contains {needle!r}: {why}")
+
+# ---- exactly one checkout, of this repository, without credentials ----------
+checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
+if len(checkouts) != 1:
+    bad(f"has {len(checkouts)} checkout steps, want exactly one")
+checkout_with = checkouts[0].get("with") or {}
+if checkout_with.get("persist-credentials") != "false":
+    bad("the checkout must set persist-credentials: false")
+if checkout_with.get("repository") is not None:
+    bad("the checkout must not name another repository")
+if checkout_with.get("token") is not None:
+    bad("the checkout must not take a token")
+
+# ---- the signing key is confined to one step -------------------------------
+secret_steps = [step for step in steps if "secrets." in step_text(step)]
+if len(secret_steps) != 1:
+    bad(f"{len(secret_steps)} steps reference a secret, want exactly one signing step")
+signing_step = secret_steps[0]
+signing_text = step_text(signing_step)
+if "secrets.JAYFLOW_RELEASE_PRIVATE_KEY" not in signing_text:
+    bad("the single secret step does not use JAYFLOW_RELEASE_PRIVATE_KEY")
+if "sign-cloudflared" not in signing_text:
+    bad("the signing key is injected into a step that does not run sign-cloudflared")
+if len(re.findall(r"\bsign-cloudflared\b", text)) != 1:
+    bad("sign-cloudflared must run exactly once")
+
+# ---- the manifest is verified afterwards, without the private key ----------
+verify_steps = [step for step in steps if "verify-cloudflared" in step_text(step)]
+if not verify_steps:
+    bad("the signed manifest is never verified")
+for step in verify_steps:
+    if "secrets." in step_text(step):
+        bad("verification must not run with the private key in scope")
+    if "vars.JAYFLOW_RELEASE_PUBLIC_KEY" not in step_text(step):
+        bad("verification must use the configured public key from vars")
+if steps.index(verify_steps[0]) <= steps.index(signing_step):
+    bad("verification must follow signing")
+
+# ---- the dispatched digest is actually enforced ----------------------------
+if "sha256sum -c --strict" not in text:
+    bad("the downloaded bytes are not checked with sha256sum -c --strict")
+if "${{ steps.inputs.outputs.sha256 }}" not in text:
+    bad("the sha256 input never reaches the digest check")
+if not re.search(r"\[\[ ! \"\$INPUT_SHA256\" =~ \^\[0-9a-f\]\{64\}\$ \]\]", text):
+    bad("cloudflared_sha256 is not pinned to 64 lowercase hex characters")
+digest_step = next((step for step in steps if "sha256sum -c --strict" in step_text(step)), None)
+download_step = next((step for step in steps if "cloudflare/cloudflared/releases/download" in step_text(step)), None)
+upload_step = next((step for step in steps if "gh release upload" in step_text(step)), None)
+guard_step = next((step for step in steps if "isDraft" in step_text(step)), None)
+for label, step in (("digest", digest_step), ("download", download_step), ("upload", upload_step), ("guard", guard_step)):
+    if step is None:
+        bad(f"has no {label} step")
+if not (steps.index(download_step) < steps.index(digest_step) < steps.index(signing_step) < steps.index(upload_step)):
+    bad("the download, digest check, signature and upload are out of order")
+if steps.index(guard_step) >= steps.index(upload_step):
+    bad("the overwrite guard must run before the upload")
+
+# ---- the download is upstream, over pinned TLS, at the exact version -------
+if "curl --proto '=https' --tlsv1.2" not in text:
+    bad("the upstream download does not pin https and TLS 1.2")
+if "https://github.com/cloudflare/cloudflared/releases/download/${VERSION}/${CLOUDFLARED_ARTIFACT}" not in text:
+    bad("the upstream download does not name the exact dispatched version and artifact")
+
+# ---- refusing to overwrite is explicit and fails closed --------------------
+guard_text = step_text(guard_step)
+for fragment in (
+    '"$(jq -r \'.isDraft\' <<<"$RELEASE_JSON")" != "false"',
+    "already carries ${NAME}; refusing to overwrite a published asset",
+    "gh release view",
+):
+    if fragment not in guard_text:
+        bad(f"the overwrite guard is missing: {fragment}")
+if 'for NAME in "$CLOUDFLARED_ARTIFACT" "$CLOUDFLARED_MANIFEST"' not in guard_text:
+    bad("the overwrite guard does not check both published names")
+
+# ---- the upload is additive, unclobbered, and exactly two files ------------
+upload_text = step_text(upload_step)
+if "--clobber" in upload_text:
+    bad("the upload clobbers")
+uploaded = re.findall(r'"\$STAGE/(\$[A-Z_]+)"', upload_text)
+if uploaded != ["$CLOUDFLARED_ARTIFACT", "$CLOUDFLARED_MANIFEST"]:
+    bad(f"the upload carries {uploaded}, want exactly the artifact and its manifest")
+
+# ---- the signed URL is the one the consumer resolves ----------------------
+if CONSUMER_URL not in text:
+    bad("the signed artifact URL is not the /releases/latest/download location the consumer pins")
+if "releases/download/${TAG}/" in text or "releases/download/$TAG/" in text:
+    bad("a per-tag artifact URL would not match the consumer's expected cloudflared location")
+
+# ---- no other release asset is named anywhere -----------------------------
+strays = {
+    r"JayFlow-": "a Windows asset",
+    r"jayflow-web-": "the Linux gateway",
+    r"(?<![-\w])latest\.json": "the Windows channel manifest",
+    r"linux-latest\.json": "the Linux channel manifest",
+    r"checksums\.txt": "the checksum inventory",
+    r"release-manifest": "the release manifest",
+    r"buildinfo\.txt": "buildinfo",
+}
+for pattern, what in strays.items():
+    if re.search(pattern, text):
+        bad(f"names {what}; the cloudflared channel must touch only its own two assets")
+
+# ---- the two workflows stay disjoint --------------------------------------
+if "cloudflared" in release_path.read_text(encoding="utf-8"):
+    bad("the ten-asset release workflow must not learn about the cloudflared channel")
+PY
+
+require_text "cloudflared-linux-amd64" "$CLOUDFLARED_WORKFLOW"
+require_text "cloudflared-latest.json" "$CLOUDFLARED_WORKFLOW"
+require_text "sha256sum -c --strict" "$CLOUDFLARED_WORKFLOW"
+require_text "verify-cloudflared" "$CLOUDFLARED_WORKFLOW"
+reject_text "--clobber" "$CLOUDFLARED_WORKFLOW"
+reject_text "JAYFLOW_SOURCE_DEPLOY_KEY" "$CLOUDFLARED_WORKFLOW"
+reject_text "release delete" "$CLOUDFLARED_WORKFLOW"
+reject_text "release edit" "$CLOUDFLARED_WORKFLOW"
+reject_text "actions/checkout@v" "$CLOUDFLARED_WORKFLOW"
+reject_text "actions/setup-go@v" "$CLOUDFLARED_WORKFLOW"
 
 printf 'release repository validation passed\n'
